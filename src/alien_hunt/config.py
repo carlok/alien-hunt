@@ -22,6 +22,20 @@ class Prices:
 
 
 @dataclass(frozen=True)
+class Endpoint:
+    """A second OpenAI-compatible endpoint, for embeddings only (`[embedding]` in the config)."""
+
+    base_url: str
+    model: str
+    api_key_env: str
+
+    def api_key(self) -> str:
+        """Read the key from the environment. Never log the return value."""
+
+        return _env_key(self.api_key_env)
+
+
+@dataclass(frozen=True)
 class Config:
     """Model endpoint and hunt limits. The key itself is not stored."""
 
@@ -36,14 +50,24 @@ class Config:
     max_tool_rounds_hunt: int = 6
     sample_limit: int = 80
     coherence_batch: int = 10
+    embedding: Endpoint | None = None
 
     def api_key(self) -> str:
         """Read the key from the environment. Never log the return value."""
 
-        value = os.environ.get(self.api_key_env, "")
-        if not value:
-            raise ConfigError(f"environment variable {self.api_key_env} is not set")
-        return value
+        return _env_key(self.api_key_env)
+
+    def secrets(self) -> tuple[str, ...]:
+        """Every key this run uses, for redaction."""
+
+        return (self.api_key(),) + ((self.embedding.api_key(),) if self.embedding else ())
+
+
+def _env_key(name: str) -> str:
+    value = os.environ.get(name, "")
+    if not value:
+        raise ConfigError(f"environment variable {name} is not set")
+    return value
 
 
 def _required(data: dict, key: str) -> object:
@@ -91,10 +115,21 @@ def load_config(path: Path) -> Config:
         output_per_mtok=_positive_float(data, "price_output_per_mtok"),
         embedding_per_mtok=_positive_float(data, "price_embedding_per_mtok"),
     )
+    embedding = None
+    if "embedding" in data:
+        table = data["embedding"]
+        if not isinstance(table, dict):
+            raise ConfigError("[embedding] must be a table")
+        embedding = Endpoint(
+            base_url=str(_required(table, "base_url")).rstrip("/"),
+            model=str(_required(table, "model")),
+            api_key_env=str(_required(table, "api_key_env")),
+        )
     return Config(
+        embedding=embedding,
         base_url=str(_required(data, "base_url")).rstrip("/"),
         model=str(_required(data, "model")),
-        embedding_model=str(_required(data, "embedding_model")),
+        embedding_model=embedding.model if embedding else str(_required(data, "embedding_model")),
         api_key_env=str(_required(data, "api_key_env")),
         prices=prices,
         max_tokens_per_hunt=_positive_int(data, "max_tokens_per_hunt"),

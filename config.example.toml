@@ -11,3 +11,10 @@ price_embedding_per_mtok = 0.02
 # Total prompt + completion tokens allowed inside one directed hunt.
 max_tokens_per_hunt = 8000
 container_image = "docker.io/library/python:3.10-slim"
+
+# Optional: embeddings from a second endpoint with its own key (for a chat provider with no embeddings API,
+# or to give the two roles two keys). Without this table, the endpoint above serves both.
+# [embedding]
+# base_url = "https://router.example/v1"
+# model = "openai/text-embedding-3-small"
+# api_key_env = "ALIEN_HUNT_EMBED_KEY"

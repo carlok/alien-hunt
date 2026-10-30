@@ -69,6 +69,14 @@ finally:
 raise SystemExit(status)
 '''
 
+# Model-written code runs in these containers: no capabilities, no privilege gain, bounded processes and memory.
+HARDENING = (
+    "--cap-drop=all",
+    "--security-opt=no-new-privileges",
+    "--pids-limit=256",
+    "--memory=2g",
+)
+
 _REQ = re.compile(r"^([A-Za-z0-9_.-]+)\s*(?:==\s*([A-Za-z0-9_.*+-]+))?")
 
 
@@ -444,6 +452,7 @@ def podman_exec_argv(
         "--rm",
         "--network",
         "none",
+        *HARDENING,
         "--read-only",
         "--tmpfs",
         "/tmp",
@@ -484,6 +493,7 @@ def podman_pip_argv(image: str, wheels: Path, deps: Path, requirements: Path) ->
         "--rm",
         "--network",
         "none",
+        *HARDENING,
         "-v",
         f"{wheels.resolve()}:/wheels:ro",
         "-v",

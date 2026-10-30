@@ -9,9 +9,13 @@ from alien_hunt.types import Claim, KnownAdvisory
 _REDACTED = "[redacted]"
 
 
-def redact(value: object, secret: str | None) -> object:
-    """Replace `secret` inside strings. Other objects pass through."""
+def redact(value: object, secret: str | tuple[str, ...] | list[str] | None) -> object:
+    """Replace `secret` (or each of several) inside strings. Other objects pass through."""
 
+    if isinstance(secret, (tuple, list)):
+        for one in secret:
+            value = redact(value, one)
+        return value
     if not secret or not isinstance(value, str):
         return value
     if secret not in value:
