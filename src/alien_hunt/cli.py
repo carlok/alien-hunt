@@ -136,6 +136,7 @@ def _run(args: argparse.Namespace) -> int:
         secret=secret,
         run_id=run_id,
         max_output=config.max_output_tokens,
+        min_coherence=config.min_coherence,
     )
     print(report)
     return 0

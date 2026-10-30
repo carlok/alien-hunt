@@ -59,6 +59,9 @@ class ScriptedModel:
         if "STAGE: invariants" in blob:
             ids = re.findall(r"inv-\S+", blob)
             return ChatResponse(json.dumps({"keep": ids}), [], 100, 50)
+        if "STAGE: mechanisms" in blob:
+            pairs = re.findall(r"^Pair (p\d+)$", blob, re.M)
+            return ChatResponse(json.dumps({"picks": [{"pair": pair, "mechanisms": ["m00", "m01", "m02"]} for pair in pairs]}), [], 100, 50)
         if "STAGE: coherence" in blob:
             return ChatResponse(json.dumps({"ratings": self._ratings(blob)}), [], 100, 50)
         if "STAGE: hunt" in blob:

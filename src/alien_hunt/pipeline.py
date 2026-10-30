@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +25,7 @@ from alien_hunt.hunt import directed_hunt
 from alien_hunt.llm import LLMError
 from alien_hunt.redact import redact
 from alien_hunt.report import overlap_functions, public_rows, render_report, unique_confirmed
-from alien_hunt.score import apply_scores, sample_triples, unavailability
+from alien_hunt.score import apply_scores, colocated_pairs, unavailability
 from alien_hunt.types import Candidate, Claim, Confirmation, KnownAdvisory
 
 log = logging.getLogger("alien_hunt")
@@ -48,6 +49,8 @@ class RunState:
     confirmations: list[tuple[Claim, Confirmation]] = field(default_factory=list)
     stopped: bool = False
     error: str | None = None
+    confirmed_vectors: list | None = None  # embeddings of the confirmed claims, in order, to merge duplicates
+    above_floor: int | None = None
 
 
 def dump_json(path: Path, payload: object) -> None:
@@ -147,6 +150,53 @@ def _rate_batch(model: PaidModel, root: Path, batch: list[Candidate], max_output
         _cap_coherence(candidate, root)
 
 
+def propose_candidates(
+    model: PaidModel,
+    pairs: list,
+    mechanisms: list,
+    *,
+    per_pair: int = 3,
+    explore: int = 1,
+    seed: int = 0,
+    batch_size: int = 8,
+    max_output: int = 4000,
+) -> list[Candidate]:
+    """For each co-located pair, the model picks up to `per_pair` mechanisms (by id) that could apply on a real path from
+    the source to the sink or invariant; `explore` more are drawn at random, so the pool keeps some unlikely ones for the
+    unavailability score to find. A batch that does not parse gets all its mechanisms drawn with `seed`."""
+
+    rng = random.Random(seed)
+    by_id = {item.id: item for item in mechanisms}
+    listing = "\n".join(f"{item.id} {item.text}" for item in mechanisms)
+    out: list[Candidate] = []
+    for offset in range(0, len(pairs), batch_size):
+        batch = pairs[offset : offset + batch_size]
+        blocks = [f"Pair p{offset + n:03d}\nsource: {s.text}\nsink or invariant: {o.text}" for n, (s, o) in enumerate(batch)]
+        user = (
+            "STAGE: mechanisms\n"
+            f"For each pair, pick up to {per_pair} mechanism ids from the list that could apply on a real path from the "
+            "source to the sink or invariant in this repository.\n"
+            'Reply with JSON only: {"picks": [{"pair": "p000", "mechanisms": ["m03", "m17"]}]}\n\n'
+            f"Mechanisms:\n{listing}\n\n" + "\n\n".join(blocks)
+        )
+        response = model.chat(stage="score", messages=[{"role": "user", "content": user}], tools=None, max_tokens=max_output)
+        try:
+            payload = parse_model_json(response.text)
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+        picks = {item.get("pair"): item.get("mechanisms") for item in payload.get("picks") or [] if isinstance(item, dict)}
+        for n, (source, other) in enumerate(batch):
+            chosen = [by_id[m] for m in (picks.get(f"p{offset + n:03d}") or []) if isinstance(m, str) and m in by_id][:per_pair]
+            if not chosen:
+                chosen = rng.sample(mechanisms, min(per_pair, len(mechanisms)))
+            rest = [item for item in mechanisms if item not in chosen]
+            chosen += rng.sample(rest, min(explore, len(rest)))
+            out.extend(Candidate(id="", source=source, mechanism=m, other=other) for m in chosen)
+    for index, candidate in enumerate(out):
+        candidate.id = f"c{index:03d}"
+    return out
+
+
 def _filter_invariants(model: PaidModel, invariants: list) -> list:
     if not invariants:
         return []
@@ -223,6 +273,7 @@ def execute(
     secret: str | None = None,
     run_id: str = "run",
     max_output: int = 4000,
+    min_coherence: float = 3.0,
 ) -> Path:
     """Run the pipeline and return the report path."""
 
@@ -242,16 +293,13 @@ def execute(
         state.habit_strings = habit_texts(state.claims, checkout, scanners=scanners)
         habit_vectors = _embed_habits(paid, state.habit_strings)
         others = [*state.sinks, *state.invariants]
-        state.candidates = sample_triples(
-            state.sources,
-            state.mechanisms,
-            others,
-            limit=sample_limit,
-            seed=seed,
-        )
+        pairs = colocated_pairs(state.sources, others, limit=max(1, sample_limit // 4), seed=seed)
+        state.candidates = propose_candidates(paid, pairs, state.mechanisms, seed=seed, max_output=max_output)[:sample_limit]
         rate_coherence(paid, checkout, state.candidates, batch_size=coherence_batch, max_output=max_output)
         state.ranked_07, state.ranked_04 = _score_pool(paid, state.candidates, habit_vectors)
-        top = state.ranked_07[:20]
+        floor = [item for item in state.ranked_07 if (item.coherence or 0) >= min_coherence]
+        state.above_floor = len(floor)
+        top = floor[:20]
         for candidate in top:
             if budget.should_stop():
                 raise BudgetStop("hunt")
@@ -273,6 +321,12 @@ def execute(
         raise LLMError(state.error) from None
 
     _confirm(state, checkout, out_dir, confirm_mode, container_image, when)
+    texts = [claim.text for claim, confirmation in state.confirmations if confirmation.confirmed]
+    if texts:
+        try:
+            state.confirmed_vectors = paid.embed(texts, stage="score").vectors
+        except (BudgetStop, LLMError):                     # merged by class alone, then
+            state.confirmed_vectors = None
     return _persist(state, out_dir, budget, known, target, commit, secret, run_id, stopped=state.stopped)
 
 
@@ -318,7 +372,7 @@ def _persist(
     stopped: bool,
 ) -> Path:
     confirmed_pairs = [(claim, confirmation) for claim, confirmation in state.confirmations if confirmation.confirmed]
-    confirmed = unique_confirmed(confirmed_pairs)
+    confirmed = unique_confirmed(confirmed_pairs, state.confirmed_vectors)
     top = state.ranked_07[:20]
     dump_json(
         out_dir / "01-habits.json",
@@ -412,6 +466,8 @@ def _persist(
         secret=secret,
         made=state.claims,
         pool=state.candidates,
+        confirmed_all=len(confirmed_pairs),
+        above_floor=state.above_floor,
     )
     if state.error:
         report += f"\n## Error\n\n{state.error}\n"

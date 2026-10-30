@@ -9,13 +9,13 @@ score = (1 - β) · z(coherence) + β · z(unavailability)
 unavailability = 1 - max cosine similarity to the plain-review claims
 ```
 
-Coherence is a 1–5 rating from the configured model. Unavailability is embedding distance from the texts that three plain reviews (and any local scanners) already produced. The run keeps the top 20 at β = 0.7 and also stores the ranking at β = 0.4.
+Candidates are built from atoms of the library itself (not its tests, docs or examples): a source and a sink or invariant that live in the same file, else the same top-level folder; the model picks up to three of the 60 mechanisms that could join them, and one more is drawn at random, so the pool keeps some unlikely ones. Only candidates rated `min_coherence` (default 3) or more are hunted; unavailability orders them. Coherence is a 1–5 rating from the configured model. Unavailability is embedding distance from the texts that three plain reviews (and any local scanners) already produced. The run keeps the top 20 at β = 0.7 and also stores the ranking at β = 0.4.
 
 ## What is measured
 
 `out/<run>/REPORT.md` records:
 
-- confirmed claims and USD for the plain reviews, and the same for the directed hunts
+- confirmed claims and USD for the plain reviews, and the same for the directed hunts; claims on one side that share a function and have the same class, or near-identical text, count once
 - confirmed claims per USD on each side
 - overlap of those confirmed claims by function name
 - how many of the top candidates the directed hunt judged incoherent, and that fraction among the ones rated 4 or 5
