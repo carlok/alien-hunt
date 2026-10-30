@@ -91,6 +91,26 @@ def _positive_float(data: dict, key: str) -> float:
     return number
 
 
+def _rating(data: dict, key: str, default: float) -> float:
+    try:
+        number = float(data.get(key, default))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{key} must be a number") from exc
+    if not 1 <= number <= 5:
+        raise ConfigError(f"{key} must be between 1 and 5")
+    return number
+
+
+def _count(data: dict, key: str, default: int) -> int:
+    try:
+        number = int(data.get(key, default))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{key} must be an integer") from exc
+    if number < 0:
+        raise ConfigError(f"{key} must be >= 0")
+    return number
+
+
 def _positive_int(data: dict, key: str, default: int | None = None) -> int:
     if key not in data:
         if default is None:
@@ -157,6 +177,6 @@ def load_config(path: Path) -> Config:
         coherence_batch=_positive_int(data, "coherence_batch", 10),
         temperature=_temperature(data),
         max_output_tokens=_positive_int(data, "max_output_tokens", 4000),
-        min_coherence=float(data.get("min_coherence", 3.0)),
-        fallback_hunts=int(data.get("fallback_hunts", 3)),
+        min_coherence=_rating(data, "min_coherence", 3.0),
+        fallback_hunts=_count(data, "fallback_hunts", 3),
     )

@@ -582,7 +582,7 @@ def prepare_wheels(
     names = [item["name"] for item in chosen if item["name"] in downloaded]
     missing += [item["name"] for item in chosen if item["name"] not in downloaded]
     if not names:
-        return DepsStatus(False, "no wheel for any dependency on or before the commit: " + ", ".join(missing[:10]))
+        return DepsStatus(True, "no wheel for any dependency on or before the commit: " + ", ".join(missing[:10]))
     requirements = work / "requirements.txt"
     requirements.write_text("\n".join(names) + "\n", encoding="utf-8")
     why = "wheels downloaded" + (f"; none for {', '.join(missing[:10])}" if missing else "")

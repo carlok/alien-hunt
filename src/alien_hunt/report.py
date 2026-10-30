@@ -116,7 +116,7 @@ def render_report(
     miss_text = "n/a" if miss is None else f"{miss:.4f}"
     rows = public_rows(claims, known)
     overlap = overlap_functions(claims)
-    overlap_text = "\n".join(f"- `{name}`" for name in overlap) or "none"
+    overlap_text = f"- Functions with a confirmed claim on both sides: {len(overlap)} (named in `local/detail.json`)"
     claim_lines = "\n".join(
         "- {alias}: {klass} ({side}){advisory}".format(
             alias=row["alias"],
