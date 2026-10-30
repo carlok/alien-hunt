@@ -18,3 +18,6 @@ container_image = "docker.io/library/python:3.10-slim"
 # base_url = "https://router.example/v1"
 # model = "openai/text-embedding-3-small"
 # api_key_env = "ALIEN_HUNT_EMBED_KEY"
+
+# Sent with every chat request; `false` leaves it out, for a model that refuses it.
+# temperature = 0
