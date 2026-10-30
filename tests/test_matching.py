@@ -64,3 +64,41 @@ def test_with_nothing_at_the_floor_the_best_rated_two_are_hunted(tmp_path):
     execute(test_pipeline.FIXTURE, model=Lukewarm(), budget=Budget(limit_usd=5), prices=Prices(1, 1, 1),
             out_dir=tmp_path / "off", sample_limit=1000, confirm_mode="local", scanners=False, run_id="off", fallback_hunts=0)
     assert "Top candidates judged: 0 of 0" in (tmp_path / "off" / "REPORT.md").read_text(encoding="utf-8")
+
+
+def test_a_src_layout_is_the_repositorys_own_and_comes_first_on_the_path(tmp_path):
+    """joserfc keeps its code in src/joserfc: the run refused all 6 reproducers as not importing the repository, and
+    fetched joserfc 1.7.4 from PyPI onto a path that came before the checkout."""
+    from pathlib import Path
+
+    from alien_hunt.confirm import podman_exec_argv, reproducer_imports
+    from alien_hunt.habits import package_names, src_layout
+
+    root = tmp_path / "repo"
+    (root / "src" / "joserfc").mkdir(parents=True)
+    (root / "src" / "joserfc" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "docs").mkdir()
+    assert src_layout(root) and package_names(root) == ["joserfc"]
+    assert reproducer_imports(["import joserfc\nfrom cryptography import x509\n"], set(package_names(root))) == ["cryptography"]
+    argv = podman_exec_argv("python:3.12-slim", root, tmp_path / "w", tmp_path / "r", tmp_path / "deps")
+    assert "PYTHONPATH=/src/src:/src:/opt/deps" in argv
+
+    flat = tmp_path / "flat"
+    (flat / "jwt").mkdir(parents=True)
+    (flat / "jwt" / "__init__.py").write_text("", encoding="utf-8")
+    (flat / "src").mkdir()                                        # a src folder with no package in it is not a layout
+    assert not src_layout(flat) and package_names(flat) == ["jwt"]
+    assert "PYTHONPATH=/src" in podman_exec_argv("python:3.12-slim", flat, tmp_path / "w", tmp_path / "r", None)
+
+
+def test_the_local_runner_sees_a_src_layout(tmp_path):
+    from alien_hunt.confirm import _run_runner
+
+    root = tmp_path / "repo"
+    (root / "src" / "pkg").mkdir(parents=True)
+    (root / "src" / "pkg" / "__init__.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    import sys
+
+    code, calls, output = _run_runner(root, "import pkg\nimport sys\nsys.exit(0 if pkg.f() == 1 else 1)\n", tmp_path / "w",
+                                      python=sys.executable)
+    assert code == 0, output

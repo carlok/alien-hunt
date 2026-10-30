@@ -19,17 +19,28 @@ Set path_exists to true.
 """
 
 
+def src_layout(root: Path) -> bool:
+    """True when the checkout keeps its packages under src/ (joserfc does; PyJWT does not)."""
+
+    base = root / "src"
+    return base.is_dir() and not (base / "__init__.py").is_file() and any(
+        (child / "__init__.py").is_file() for child in base.iterdir() if child.is_dir()
+    )
+
+
 def package_names(root: Path) -> list[str]:
-    """Top-level import names in a checkout."""
+    """Top-level import names in a checkout: at its root, and under src/ for a src layout. joserfc's run found none,
+    refused every reproducer as not importing the repository, and fetched joserfc itself from PyPI."""
 
     names: list[str] = []
-    for child in sorted(root.iterdir(), key=lambda item: item.name):
-        if child.name.startswith(".") or child.name == "__pycache__":
-            continue
-        if child.is_dir() and (child / "__init__.py").is_file():
-            names.append(child.name)
-        elif child.suffix == ".py" and child.name not in {"setup.py", "conftest.py"}:
-            names.append(child.stem)
+    for base in (root, root / "src") if src_layout(root) else (root,):
+        for child in sorted(base.iterdir(), key=lambda item: item.name):
+            if child.name.startswith(".") or child.name == "__pycache__":
+                continue
+            if child.is_dir() and (child / "__init__.py").is_file():
+                names.append(child.name)
+            elif child.suffix == ".py" and child.name not in {"setup.py", "conftest.py"}:
+                names.append(child.stem)
     return names
 
 
