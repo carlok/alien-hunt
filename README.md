@@ -20,7 +20,7 @@ Candidates are built from atoms of the library itself (not its tests, docs or ex
 - overlap of those confirmed claims by function name
 - how many of the top candidates the directed hunt judged incoherent, and that fraction among the ones rated 4 or 5
 
-A claim counts only when its reproducer imports the repository, calls the named function, and exits 0. A script that reads source text does not count. Confirmation runs in Podman with `--network none`, the checkout mounted read-only, and third-party dependencies installed from wheels uploaded on or before the commit. Nothing is built from source.
+A claim counts only when its reproducer imports the repository, calls the named function, and exits 0. A script that reads source text does not count. Confirmation runs in Podman with `--network none`, the checkout mounted read-only, and third-party dependencies installed from wheels uploaded on or before the commit: the declared ones, the packages the reproducers import, and their own dependencies (read from each wheel's METADATA). A package with no such wheel is named in the log and left out. Nothing is built from source.
 
 The run stops before the next paid call once 80% of `--budget` is spent, and still writes the report.
 
