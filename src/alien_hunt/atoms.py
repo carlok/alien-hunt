@@ -80,6 +80,66 @@ def _sentences(doc: str) -> list[str]:
     return [part.strip() for part in parts if part.strip()]
 
 
+# Calls that turn caller input into new objects: what they allocate is in proportion to the input.
+_DECODERS = {
+    "base64.urlsafe_b64decode": "base64 decode", "base64.b64decode": "base64 decode", "urlsafe_b64decode": "base64 decode",
+    "b64decode": "base64 decode", "json.loads": "json.loads", "zlib.decompress": "zlib decompress",
+    "gzip.decompress": "gzip decompress", "bz2.decompress": "bz2 decompress", "lzma.decompress": "lzma decompress",
+}
+
+
+def _rooted_in(node: ast.AST, params: set[str]) -> bool:
+    """True when an expression is a parameter, or reaches one through subscripts, attributes and method calls
+    (`data["recipients"]`, `obj.items()`, `value.split(b".")`)."""
+
+    while True:
+        if isinstance(node, ast.Name):
+            return node.id in params
+        if isinstance(node, (ast.Subscript, ast.Attribute)):
+            node = node.value
+        elif isinstance(node, ast.Call):
+            node = node.func.value if isinstance(node.func, ast.Attribute) else (node.args[0] if node.args else None)
+            if node is None:
+                return False
+        else:
+            return False
+
+
+def _input_sinks(func: ast.AST, relative: str) -> list[Atom]:
+    """Where a function's own input sets the work or the memory: a loop over it, or a decode, split or decompress of it.
+    joserfc's two advisories are of this kind (a JWE recipients list processed in full; compact segments split and
+    decoded before the size check), and the first sinks (eval, pickle, a multiplication) gave the hunts nothing there."""
+
+    params = {arg.arg for arg in func.args.args + func.args.kwonlyargs} - {"self", "cls"}
+    if not params:
+        return []
+    out: list[Atom] = []
+    for node in ast.walk(func):
+        iters = []
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            iters = [node.iter]
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            iters = [gen.iter for gen in node.generators]
+        for it in iters:
+            if _rooted_in(it, params):
+                expr = ast.unparse(it)[:60]
+                out.append(Atom(kind="sink", id=f"sink-{relative}-{func.name}-loop-{getattr(it, 'lineno', 0)}",
+                                text=f"loop over caller-supplied {expr} in {func.name}", file=relative, function=func.name))
+        if isinstance(node, ast.Call):
+            name = _call_name(node)
+            label = _DECODERS.get(name)
+            if label is None and isinstance(node.func, ast.Attribute) and node.func.attr in ("split", "rsplit", "splitlines"):
+                label = node.func.attr
+                arg = node.func.value
+            else:
+                arg = node.args[0] if node.args else None
+            if label and arg is not None and _rooted_in(arg, params):
+                expr = ast.unparse(arg)[:60]
+                out.append(Atom(kind="sink", id=f"sink-{relative}-{func.name}-{label}-{getattr(node, 'lineno', 0)}",
+                                text=f"{label} of caller-supplied {expr} in {func.name}", file=relative, function=func.name))
+    return out
+
+
 def _spread(items: list[Atom], limit: int) -> list[Atom]:
     if len(items) <= limit:
         return items
@@ -113,6 +173,8 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
             continue
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for atom in _input_sinks(node, relative):
+                    add(sinks, atom)
                 for arg in node.args.args:
                     if arg.arg in {"self", "cls"}:
                         continue
