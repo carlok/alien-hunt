@@ -51,13 +51,16 @@ def _habit_lines_from_bandit(payload: dict) -> list[str]:
 
 
 def _run(command: list[str], timeout: int) -> str:
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ""
     return completed.stdout or ""
 
 

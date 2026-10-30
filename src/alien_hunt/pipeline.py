@@ -384,7 +384,7 @@ def _persist(
 ) -> Path:
     confirmed_pairs = [(claim, confirmation) for claim, confirmation in state.confirmations if confirmation.confirmed]
     confirmed = unique_confirmed(confirmed_pairs, state.confirmed_vectors)
-    top = state.hunted                      # what was hunted, not the top of the score (#4's first run listed the latter)
+    top = state.hunted                      # what was hunted, not the top of the score (an earlier version listed the latter)
     dump_json(
         out_dir / "01-habits.json",
         {

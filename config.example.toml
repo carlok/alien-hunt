@@ -29,3 +29,10 @@ container_image = "docker.io/library/python:3.10-slim"
 # min_coherence = 3
 # Candidates in the pool (4 per co-located pair).
 # sample_limit = 80
+# When no candidate reaches min_coherence, the best this many rated 2 are hunted (0 turns it off).
+# fallback_hunts = 3
+# Tool rounds for a plain review and for a directed hunt.
+# max_tool_rounds_review = 8
+# max_tool_rounds_hunt = 6
+# Candidates rated per coherence request.
+# coherence_batch = 10
