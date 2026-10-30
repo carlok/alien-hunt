@@ -51,6 +51,7 @@ class Config:
     sample_limit: int = 80
     coherence_batch: int = 10
     embedding: Endpoint | None = None
+    temperature: float | None = 0.0  # None: the parameter is not sent (some models refuse it)
 
     def api_key(self) -> str:
         """Read the key from the environment. Never log the return value."""
@@ -101,6 +102,19 @@ def _positive_int(data: dict, key: str, default: int | None = None) -> int:
     return number
 
 
+def _temperature(data: dict) -> float | None:
+    """0 when absent, as before; `temperature = false` leaves the parameter out of every chat request."""
+
+    if "temperature" not in data:
+        return 0.0
+    value = data["temperature"]
+    if value is False:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 2:
+        raise ConfigError("temperature must be a number from 0 to 2, or false to leave it out")
+    return float(value)
+
+
 def load_config(path: Path) -> Config:
     """Load a TOML config. The key field is the name of an environment variable."""
 
@@ -138,4 +152,5 @@ def load_config(path: Path) -> Config:
         max_tool_rounds_hunt=_positive_int(data, "max_tool_rounds_hunt", 6),
         sample_limit=_positive_int(data, "sample_limit", 80),
         coherence_batch=_positive_int(data, "coherence_batch", 10),
+        temperature=_temperature(data),
     )

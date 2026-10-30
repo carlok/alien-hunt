@@ -29,6 +29,7 @@ class OpenAIModel:
         self.model = config.model
         self.embedding_model = config.embedding_model
         self.base_url = config.base_url
+        self.temperature = config.temperature
         secrets = config.secrets()
         for secret in secrets:
             install_secret_filter(secret)
@@ -53,8 +54,9 @@ class OpenAIModel:
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0,
         }
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         if tools:
             kwargs["tools"] = tools
         try:

@@ -98,3 +98,37 @@ def test_the_pip_container_is_hardened_too(tmp_path):
     for flag in HARDENING:
         assert flag in argv
     assert argv[argv.index("--network") + 1] == "none"
+
+
+def test_temperature_defaults_to_zero_and_false_leaves_it_out(tmp_path, monkeypatch):
+    monkeypatch.setenv("AH_TEST_CHAT", "chat-secret-1")
+    assert load_config(write(tmp_path, BASE)).temperature == 0.0
+    assert load_config(write(tmp_path, "temperature = 0.3\n" + BASE)).temperature == 0.3
+    assert load_config(write(tmp_path, "temperature = false\n" + BASE)).temperature is None
+    for bad in ("true", "3", '"low"'):
+        with pytest.raises(ConfigError, match="temperature"):
+            load_config(write(tmp_path, f"temperature = {bad}\n" + BASE))
+
+
+def test_the_chat_request_carries_temperature_only_when_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("AH_TEST_CHAT", "chat-secret-1")
+    sent = []
+
+    class Completions:
+        def create(self, **kwargs):
+            sent.append(kwargs)
+            message = types.SimpleNamespace(content="done", tool_calls=None)
+            return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)],
+                                         usage=types.SimpleNamespace(prompt_tokens=3, completion_tokens=1))
+
+    class FakeOpenAI:
+        def __init__(self, base_url, api_key):
+            self.chat = types.SimpleNamespace(completions=Completions())
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+    from alien_hunt.llm import OpenAIModel
+
+    for text, expected in ((BASE, 0.0), ("temperature = false\n" + BASE, None)):
+        OpenAIModel(load_config(write(tmp_path, text))).chat(messages=[{"role": "user", "content": "hi"}], tools=None, max_tokens=5)
+        assert sent[-1].get("temperature", None) == expected
+        assert ("temperature" in sent[-1]) is (expected is not None)
