@@ -96,43 +96,55 @@ def rate_coherence(
     candidates: list[Candidate],
     *,
     batch_size: int,
+    max_output: int = 4000,
 ) -> None:
-    """Ask the model whether each triple can occur here. A missing path caps the score at 2."""
+    """Ask the model whether each triple can occur here. A missing path caps the score at 2.
+
+    A batch whose reply does not parse, or was cut at `max_output`, is asked again in two halves, down to single
+    candidates; a candidate never rated keeps the floor of 1 and `rated` False, so the report can say how many were."""
 
     for offset in range(0, len(candidates), batch_size):
-        batch = candidates[offset : offset + batch_size]
-        blocks = []
-        for item in batch:
-            blocks.append(f"Candidate {item.id}\n{item.triple_text()}")
-        user = (
-            "STAGE: coherence\n"
-            "Rate each candidate from 1 to 5 for whether it can occur on a real call path "
-            "in this repository. Name the path as file:function entries that exist in the tree.\n"
-            'Reply with JSON: {"ratings": [{"id": "c000", "score": 3, "path": ["pkg/mod.py:fn"]}]}\n\n'
-            + "\n\n".join(blocks)
-        )
-        response = model.chat(
-            stage="score",
-            messages=[{"role": "user", "content": user}],
-            tools=None,
-            max_tokens=1200,
-        )
+        _rate_batch(model, root, candidates[offset : offset + batch_size], max_output)
+
+
+def _rate_batch(model: PaidModel, root: Path, batch: list[Candidate], max_output: int) -> None:
+    blocks = [f"Candidate {item.id}\n{item.triple_text()}" for item in batch]
+    user = (
+        "STAGE: coherence\n"
+        "Rate each candidate from 1 to 5 for whether it can occur on a real call path "
+        "in this repository. Name the path as file:function entries that exist in the tree.\n"
+        'Reply with JSON only: {"ratings": [{"id": "c000", "score": 3, "path": ["pkg/mod.py:fn"]}]}\n\n'
+        + "\n\n".join(blocks)
+    )
+    response = model.chat(
+        stage="score",
+        messages=[{"role": "user", "content": user}],
+        tools=None,
+        max_tokens=max_output,
+    )
+    try:
+        payload = parse_model_json(response.text)
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+    if (payload is None or response.finish_reason == "length") and len(batch) > 1:
+        half = len(batch) // 2
+        log.info("coherence: a batch of %s did not parse; asking in halves", len(batch))
+        _rate_batch(model, root, batch[:half], max_output)
+        _rate_batch(model, root, batch[half:], max_output)
+        return
+    by_id = {item.get("id"): item for item in (payload or {}).get("ratings") or [] if isinstance(item, dict)}
+    for candidate in batch:
+        rating = by_id.get(candidate.id) or {}
         try:
-            payload = parse_model_json(response.text)
-        except (json.JSONDecodeError, ValueError):
-            payload = {"ratings": []}
-        by_id = {item.get("id"): item for item in payload.get("ratings") or [] if isinstance(item, dict)}
-        for candidate in batch:
-            rating = by_id.get(candidate.id) or {}
-            try:
-                candidate.coherence = float(rating.get("score"))
-            except (TypeError, ValueError):
-                candidate.coherence = 1.0
-            path = rating.get("path") or []
-            if isinstance(path, str):
-                path = [path]
-            candidate.path = [str(entry) for entry in path]
-            _cap_coherence(candidate, root)
+            candidate.coherence = float(rating.get("score"))
+            candidate.rated = True
+        except (TypeError, ValueError):
+            candidate.coherence = 1.0
+        path = rating.get("path") or []
+        if isinstance(path, str):
+            path = [path]
+        candidate.path = [str(entry) for entry in path]
+        _cap_coherence(candidate, root)
 
 
 def _filter_invariants(model: PaidModel, invariants: list) -> list:
@@ -210,6 +222,7 @@ def execute(
     commit: str = "",
     secret: str | None = None,
     run_id: str = "run",
+    max_output: int = 4000,
 ) -> Path:
     """Run the pipeline and return the report path."""
 
@@ -224,7 +237,7 @@ def execute(
         state.sources, state.sinks, state.invariants, state.mechanisms = extract_atoms(checkout)
         state.invariants = _filter_invariants(paid, state.invariants)
         state.claims.extend(
-            plain_reviews(paid, checkout, rounds=review_rounds)
+            plain_reviews(paid, checkout, rounds=review_rounds, max_output=max_output)
         )
         state.habit_strings = habit_texts(state.claims, checkout, scanners=scanners)
         habit_vectors = _embed_habits(paid, state.habit_strings)
@@ -236,7 +249,7 @@ def execute(
             limit=sample_limit,
             seed=seed,
         )
-        rate_coherence(paid, checkout, state.candidates, batch_size=coherence_batch)
+        rate_coherence(paid, checkout, state.candidates, batch_size=coherence_batch, max_output=max_output)
         state.ranked_07, state.ranked_04 = _score_pool(paid, state.candidates, habit_vectors)
         top = state.ranked_07[:20]
         for candidate in top:
@@ -248,6 +261,7 @@ def execute(
                 candidate,
                 rounds=hunt_rounds,
                 token_cap=hunt_token_cap,
+                max_output=max_output,
             )
             state.claims.extend(result.claims)
     except BudgetStop:
@@ -396,6 +410,8 @@ def _persist(
         known=known,
         stopped=stopped or state.stopped,
         secret=secret,
+        made=state.claims,
+        pool=state.candidates,
     )
     if state.error:
         report += f"\n## Error\n\n{state.error}\n"

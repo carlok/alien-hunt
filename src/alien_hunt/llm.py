@@ -63,6 +63,7 @@ class OpenAIModel:
             response = self._client.chat.completions.create(**kwargs)
         except Exception as exc:
             raise LLMError(str(redact(str(exc), self._secret))) from None
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
         choice = response.choices[0].message
         tool_calls: list[ToolCall] = []
         for call in choice.tool_calls or []:
@@ -96,6 +97,7 @@ class OpenAIModel:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             estimated=estimated,
+            finish_reason=finish_reason,
         )
 
     def embed(self, texts: list[str]) -> EmbedResponse:

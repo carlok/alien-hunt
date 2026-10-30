@@ -146,18 +146,40 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "submit_claims",
-            "description": "Submit up to 10 claims and stop. Each claim needs a Python reproducer.",
+            "description": "Submit up to 10 claims and stop. Each claim needs a Python reproducer. An empty list is a valid answer.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path_exists": {"type": "boolean"},
-                    "claims": {"type": "array"},
+                    "claims": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "class": {"type": "string"},
+                                "files": {"type": "array", "items": {"type": "string"}},
+                                "functions": {"type": "array", "items": {"type": "string"}},
+                                "reproducer": {"type": "string"},
+                            },
+                            "required": ["text", "class", "files", "functions", "reproducer"],
+                        },
+                    },
                 },
                 "required": ["path_exists", "claims"],
             },
         },
     },
 ]
+SUBMIT_ONLY = [tool for tool in TOOLS if tool["function"]["name"] == "submit_claims"]
+LAST_TURN = (
+    "This is your last turn. Call submit_claims now with what you have found and can support from the files "
+    "(an empty claims list is fine)."
+)
+CUT_SHORT = (
+    "Your last reply was cut at the length limit, so it was not received. Call submit_claims again with at most "
+    "3 claims and short reproducers."
+)
 
 
 def _run_tool(root: Path, call: ToolCall, line_cap: int) -> str:
@@ -218,6 +240,7 @@ class AgentResult:
     path_exists: bool | None = None
     rounds: int = 0
     tokens: int = 0
+    submitted: bool = False
 
 
 class PaidModel:
@@ -269,24 +292,45 @@ def run_agent(
     token_cap: int | None,
     candidate_id: str | None = None,
     line_cap: int = 200,
+    max_output: int = 4000,
 ) -> AgentResult:
-    """Run a review until it submits claims, runs out of rounds, or hits the token cap."""
+    """Run a review until it submits claims, runs out of rounds, or hits the token cap.
+
+    The last round (by count, or once 75% of the token cap is used) offers submit_claims alone and says so, so a
+    review that explored until the end still answers. A reply cut at `max_output` is not trusted (its tool call may
+    be truncated JSON): the model is asked once more for fewer, shorter claims, with submit_claims alone."""
 
     messages: list[dict] = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
     result = AgentResult()
-    for _ in range(max_rounds):
-        if token_cap is not None and result.tokens >= token_cap:
+    force, allowed, retried = False, max_rounds, False
+    while result.rounds < allowed:
+        if token_cap is not None and result.tokens >= token_cap and not retried:
             break
-        response = model.chat(stage=stage, messages=messages, tools=TOOLS, max_tokens=1200)
+        last = force or result.rounds == allowed - 1 or (token_cap is not None and result.tokens >= 0.75 * token_cap)
+        if last and not force:
+            messages.append({"role": "user", "content": LAST_TURN})
+            force = True
+        response = model.chat(
+            stage=stage, messages=messages, tools=SUBMIT_ONLY if last else TOOLS, max_tokens=max_output
+        )
         result.rounds += 1
         result.tokens += response.prompt_tokens + response.completion_tokens
+        if response.finish_reason == "length":
+            if retried:
+                break
+            retried = True                        # one more turn, even past the rounds or the cap: a cut submit is the costliest loss
+            allowed = max(allowed, result.rounds + 1)
+            messages.append({"role": "user", "content": CUT_SHORT})
+            force = True
+            continue
         submits = [call for call in response.tool_calls if call.name == "submit_claims"]
         others = [call for call in response.tool_calls if call.name != "submit_claims"]
         if submits:
             payload = submits[0].arguments
+            result.submitted = True
             if "path_exists" in payload:
                 result.path_exists = bool(payload.get("path_exists"))
             result.claims = parse_claims(
@@ -297,7 +341,13 @@ def run_agent(
             )
             return result
         if not others:
-            break
+            if last:
+                break
+            if response.text:                     # a plain-text answer: ask for the tool call once, as the last turn
+                messages.append({"role": "assistant", "content": response.text})
+            messages.append({"role": "user", "content": LAST_TURN})
+            force = True
+            continue
         messages.append(
             {
                 "role": "assistant",

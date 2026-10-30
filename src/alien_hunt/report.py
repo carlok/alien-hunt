@@ -71,6 +71,8 @@ def render_report(
     known: list[KnownAdvisory],
     stopped: bool,
     secret: str | None = None,
+    made: list[Claim] | None = None,
+    pool: list[Candidate] | None = None,
 ) -> str:
     """Markdown metrics. Reproducers and narratives are not included."""
 
@@ -81,6 +83,11 @@ def render_report(
     other_usd = budget.spent - plain_usd - hunt_usd
     judged = [item for item in top if item.incoherent is not None]
     incoherent = sum(1 for item in judged if item.incoherent)
+    made = made if made is not None else claims
+    made_plain = sum(1 for claim in made if claim.origin == "plain")
+    made_directed = len(made) - made_plain
+    pool = pool if pool is not None else top
+    rated = sum(1 for item in pool if item.rated)
     miss = coherence_miss_rate(top)
     miss_text = "n/a" if miss is None else f"{miss:.4f}"
     rows = public_rows(claims, known)
@@ -106,12 +113,14 @@ def render_report(
 
 ## Plain reviews
 
+- Claims made: {made_plain}
 - Confirmed claims: {len(plain_claims)}
 - USD: {plain_usd:.4f}
 - Confirmed per USD: {_per_usd(len(plain_claims), plain_usd)}
 
 ## Directed hunts
 
+- Claims made: {made_directed}
 - Confirmed claims: {len(directed_claims)}
 - USD: {hunt_usd:.4f}
 - Confirmed per USD: {_per_usd(len(directed_claims), hunt_usd)}
@@ -128,7 +137,8 @@ def render_report(
 
 Ranked at β = 0.7. The same pool is stored at β = 0.4.
 
-- Top candidates judged: {len(judged)}
+- Coherence ratings parsed: {rated} of {len(pool)} (an unparsed one counts as 1)
+- Top candidates judged: {len(judged)} of {len(top)} (a hunt that never submitted gives no verdict)
 - Incoherent among them: {incoherent}
 - Miss rate among ratings of 4 or 5: {miss_text}
 

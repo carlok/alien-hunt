@@ -23,6 +23,7 @@ class ChatResponse:
     prompt_tokens: int
     completion_tokens: int
     estimated: bool = False
+    finish_reason: str | None = None  # "length": the reply was cut at max_tokens
 
 
 @dataclass
@@ -91,6 +92,7 @@ class Candidate:
     score_0_4: float | None = None
     incoherent: bool | None = None
     path_exists: bool | None = None
+    rated: bool = False  # the coherence rating was parsed, not defaulted
 
     def triple_text(self) -> str:
         return f"{self.source.text} || {self.mechanism.text} || {self.other.text}"

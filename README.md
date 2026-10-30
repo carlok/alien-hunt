@@ -47,6 +47,8 @@ These two commands are the case studies. They send the target tree only to the e
 
 Chat and embeddings both use that OpenAI-compatible endpoint, unless the config has an `[embedding]` table. Then embeddings go to that table's `base_url` and `model`, with the key in its own `api_key_env`. Use it when the chat provider has no embeddings API (Anthropic's OpenAI-compatible endpoint, for one) or when the two roles should use two keys. If the endpoint used for embeddings has none, the run stops. Prices in the config are USD per million tokens and are what the budget uses. Every key the run uses is filtered from logs and redacted from the report. Chat requests send `temperature = 0` unless the config sets another value, or `temperature = false` for a model that refuses the parameter (Claude Sonnet 5.5 through Anthropic's OpenAI-compatible endpoint, for one).
 
+A review or a hunt gets a last turn that can only submit (on its last round, or once 75% of its token cap is used), and a reply cut at `max_output_tokens` (default 4000) is asked again once, with at most three claims. A coherence batch that does not parse is asked again in halves. The report says how many claims each side made, how many coherence ratings parsed, and how many top candidates got a verdict.
+
 Both containers that touch model-written code (the reproducer and the offline wheel install) run with no network, all capabilities dropped, no privilege gain, and a pids and a memory limit.
 
 ## Tests
