@@ -1,0 +1,13 @@
+base_url = "https://api.openai.com/v1"
+model = "gpt-4.1-mini"
+embedding_model = "text-embedding-3-small"
+api_key_env = "ALIEN_HUNT_API_KEY"
+
+# USD per million tokens. The run stops when 80% of --budget is spent.
+price_input_per_mtok = 0.40
+price_output_per_mtok = 1.60
+price_embedding_per_mtok = 0.02
+
+# Total prompt + completion tokens allowed inside one directed hunt.
+max_tokens_per_hunt = 8000
+container_image = "docker.io/library/python:3.10-slim"

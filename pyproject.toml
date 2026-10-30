@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alien-hunt"
+version = "0.1.0"
+description = "Sample defect combinations a plain review does not already produce, then confirm them."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["openai>=1.40"]
+
+[project.scripts]
+alien-hunt = "alien_hunt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+alien_hunt = ["data/*.json", "data/semgrep/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

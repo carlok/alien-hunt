@@ -1,0 +1,9 @@
+url = "https://github.com/jpadilla/pyjwt"
+commit = "98620ab2a396a5c887a494259d49552c2093e1ad"
+budget = 5
+
+[[known]]
+id = "GHSA-ffqj-6fqr-9h24"
+cve = "CVE-2022-29217"
+class = "key confusion"
+symbols = ["jwt.api_jwk", "PyJWK", "jwt.algorithms"]

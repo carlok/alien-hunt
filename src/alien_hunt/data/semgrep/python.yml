@@ -1,0 +1,41 @@
+rules:
+  - id: ah-pickle-loads
+    languages: [python]
+    message: Caller-supplied bytes are passed to a general object loader.
+    severity: WARNING
+    pattern: pickle.loads(...)
+  - id: ah-pickle-load
+    languages: [python]
+    message: A file object is passed to a general object loader.
+    severity: WARNING
+    pattern: pickle.load(...)
+  - id: ah-eval
+    languages: [python]
+    message: eval is called.
+    severity: ERROR
+    pattern: eval(...)
+  - id: ah-exec
+    languages: [python]
+    message: exec is called.
+    severity: ERROR
+    pattern: exec(...)
+  - id: ah-os-system
+    languages: [python]
+    message: A command string is handed to the shell via os.system.
+    severity: ERROR
+    pattern: os.system(...)
+  - id: ah-subprocess-shell
+    languages: [python]
+    message: A subprocess is started with shell parsing enabled.
+    severity: ERROR
+    pattern: subprocess.$FUNC(..., shell=True, ...)
+  - id: ah-yaml-load
+    languages: [python]
+    message: yaml.load is called. A safe loader is the usual alternative.
+    severity: WARNING
+    pattern: yaml.load(...)
+  - id: ah-path-join
+    languages: [python]
+    message: Two path parts are joined.
+    severity: INFO
+    pattern: os.path.join(...)

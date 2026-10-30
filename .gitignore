@@ -1,0 +1,10 @@
+out/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+alien-hunt.toml
+.env
