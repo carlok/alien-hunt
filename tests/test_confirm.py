@@ -156,6 +156,8 @@ def test_podman_argv_is_offline_and_read_only(tmp_path: Path):
     assert argv[0] == "podman"
     assert "none" in argv
     assert "--network" in argv
+    for flag in ("--cap-drop=all", "--security-opt=no-new-privileges", "--pids-limit=256", "--memory=2g"):
+        assert flag in argv
     assert any(part.endswith(":/src:ro") for part in argv)
     assert any(part.endswith(":/work:ro") for part in argv)
     assert "sk-" not in rendered

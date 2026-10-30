@@ -99,7 +99,7 @@ def _run(args: argparse.Namespace) -> int:
         raise ConfigError("budget must be >= 0")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config(args.config)
-    secret = config.api_key()
+    secret = config.secrets()
     model = OpenAIModel(config)
     if args.local:
         checkout = prepare_local(args.local)

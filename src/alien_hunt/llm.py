@@ -23,23 +23,27 @@ def estimate_tokens(text: str) -> int:
 
 
 class OpenAIModel:
-    """Chat and embeddings against one configured base URL."""
+    """Chat against the configured base URL; embeddings there too, or at `[embedding]`'s endpoint when the config has one."""
 
     def __init__(self, config: Config) -> None:
         self.model = config.model
         self.embedding_model = config.embedding_model
         self.base_url = config.base_url
-        secret = config.api_key()
-        install_secret_filter(secret)
-        self._secret = secret
+        secrets = config.secrets()
+        for secret in secrets:
+            install_secret_filter(secret)
+        self._secret = secrets
         try:
             from openai import OpenAI
         except ImportError as exc:
             raise LLMError("the openai package is not installed") from exc
         try:
-            self._client = OpenAI(base_url=config.base_url, api_key=secret)
+            self._client = OpenAI(base_url=config.base_url, api_key=secrets[0])
+            self._embed_client = (
+                OpenAI(base_url=config.embedding.base_url, api_key=secrets[1]) if config.embedding else self._client
+            )
         except Exception as exc:
-            raise LLMError(str(redact(str(exc), secret))) from None
+            raise LLMError(str(redact(str(exc), secrets))) from None
 
     def __repr__(self) -> str:
         return f"OpenAIModel(model={self.model!r}, base_url={self.base_url!r})"
@@ -96,7 +100,7 @@ class OpenAIModel:
         if not texts:
             return EmbedResponse(vectors=[], prompt_tokens=0, estimated=False)
         try:
-            response = self._client.embeddings.create(model=self.embedding_model, input=texts)
+            response = self._embed_client.embeddings.create(model=self.embedding_model, input=texts)
         except Exception as exc:
             message = str(redact(str(exc), self._secret))
             lowered = message.lower()
