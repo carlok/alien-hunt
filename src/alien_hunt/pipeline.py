@@ -19,6 +19,7 @@ from alien_hunt.confirm import (
     confirm_podman,
     install_wheels,
     prepare_wheels,
+    python_tag_for,
     reproducer_imports,
 )
 from alien_hunt.habits import habit_texts, package_names, plain_reviews
@@ -52,6 +53,7 @@ class RunState:
     error: str | None = None
     confirmed_vectors: list | None = None  # embeddings of the confirmed claims, in order, to merge duplicates
     hunted: list[Candidate] = field(default_factory=list)  # the candidates actually hunted (at or above the floor)
+    fallback: int = 0  # hunted below the floor, because none reached it
     above_floor: int | None = None
 
 
@@ -276,6 +278,7 @@ def execute(
     run_id: str = "run",
     max_output: int = 4000,
     min_coherence: float = 3.0,
+    fallback_hunts: int = 3,
 ) -> Path:
     """Run the pipeline and return the report path."""
 
@@ -301,6 +304,9 @@ def execute(
         state.ranked_07, state.ranked_04 = _score_pool(paid, state.candidates, habit_vectors)
         floor = [item for item in state.ranked_07 if (item.coherence or 0) >= min_coherence]
         state.above_floor = len(floor)
+        if not floor and fallback_hunts:                # asciitree: nothing reached 3, so nothing was hunted
+            floor = [item for item in state.ranked_07 if item.rated and (item.coherence or 0) >= 2][:fallback_hunts]
+            state.fallback = len(floor)
         top = floor[:20]
         state.hunted = top
         for candidate in top:
@@ -346,7 +352,7 @@ def _confirm(
     deps = DepsStatus(True, "not requested")
     if mode == "podman":
         imports = reproducer_imports([claim.reproducer for claim in state.claims], set(package_names(checkout)))
-        deps = prepare_wheels(checkout, commit_time, work, imports=imports)
+        deps = prepare_wheels(checkout, commit_time, work, imports=imports, python_tag=python_tag_for(image))
         log.info("dependencies: %s", deps.why)
         if deps.ok and deps.target is not None:
             failure = install_wheels(image, work, deps)
@@ -473,6 +479,7 @@ def _persist(
         pool=state.candidates,
         confirmed_all=len(confirmed_pairs),
         above_floor=state.above_floor,
+        fallback=state.fallback,
     )
     if state.error:
         report += f"\n## Error\n\n{state.error}\n"

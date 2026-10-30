@@ -6,4 +6,4 @@ budget = 5
 id = "GHSA-ffqj-6fqr-9h24"
 cve = "CVE-2022-29217"
 class = "key confusion"
-symbols = ["jwt.api_jwk", "PyJWK", "jwt.algorithms"]
+symbols = ["jwt.api_jwk", "PyJWK", "jwt.algorithms", "HMACAlgorithm"]

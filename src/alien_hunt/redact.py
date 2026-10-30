@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from alien_hunt.types import Claim, KnownAdvisory
 
@@ -66,12 +67,42 @@ def symbol_hit(functions: list[str], symbol: str) -> bool:
     return False
 
 
+_GENERIC = {"error", "errors", "issue", "issues", "defect", "bug", "bugs", "flaw", "vulnerability", "weakness"}
+
+
+def _class_words(label: str) -> set[str]:
+    return {word for word in re.split(r"[^a-z0-9]+", label.lower()) if len(word) >= 4 and word not in _GENERIC}
+
+
+def class_hit(label: str, advisory: KnownAdvisory) -> bool:
+    """The claim's class names the advisory's: equal, or sharing a word (of four letters or more, not a generic one like
+    "error") with its class or one of its `classes`. On PyJWT the hunt said "algorithm-confusion" for an advisory filed
+    as "key confusion", and the report did not cite it."""
+
+    words = _class_words(label)
+    for name in [advisory.class_label, *advisory.classes]:
+        if label.strip().lower() == name.strip().lower() or words & _class_words(name):
+            return True
+    return False
+
+
+def file_hit(files: list[str], symbol: str) -> bool:
+    """True when a dotted module symbol names one of the claim's files (`jwt.algorithms` for `jwt/algorithms.py`)."""
+
+    path = symbol.replace(".", "/")
+    for name in files:
+        clean = name.replace("\\", "/").removesuffix(".py")
+        if clean == path or clean.endswith("/" + path):
+            return True
+    return False
+
+
 def matching_advisory(claim: Claim, known: list[KnownAdvisory]) -> KnownAdvisory | None:
-    """Cite an advisory only when both the class and a symbol match."""
+    """Cite an advisory only when both the class and a symbol match; a symbol matches a function or a file."""
 
     for advisory in known:
-        if claim.class_label != advisory.class_label:
+        if not class_hit(claim.class_label, advisory):
             continue
-        if any(symbol_hit(claim.functions, symbol) for symbol in advisory.symbols):
+        if any(symbol_hit(claim.functions, symbol) or file_hit(claim.files, symbol) for symbol in advisory.symbols):
             return advisory
     return None

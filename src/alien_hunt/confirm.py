@@ -254,6 +254,15 @@ def confirm_local(claim: Claim, checkout: Path, work: Path, *, python: str | Non
     return interpret_run(claim, code, calls, output)
 
 
+def python_tag_for(image: str) -> str:
+    """The CPython wheel tag of a `python:3.X...` image (`docker.io/library/python:3.12-slim` gives `cp312`); cp310 for
+    an image whose name says no version. joserfc needs 3.11 or later, and the run fetched cp310 wheels whatever the
+    container."""
+
+    match = re.search(r"python:3\.(\d+)", image)
+    return f"cp3{match.group(1)}" if match else "cp310"
+
+
 def wheel_compatible(filename: str, python_tag: str = "cp310", arch: str = "x86_64") -> bool:
     """Accept a pure-Python wheel, or a glibc Linux wheel for the container's CPython and architecture: built for
     exactly that version, or for the stable ABI (`abi3`) from any earlier 3.x. A musllinux wheel does not run on the

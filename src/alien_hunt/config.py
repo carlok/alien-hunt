@@ -54,6 +54,7 @@ class Config:
     temperature: float | None = 0.0  # None: the parameter is not sent (some models refuse it)
     max_output_tokens: int = 4000  # one reply's limit: a review's claims with reproducers, a batch of ratings
     min_coherence: float = 3.0  # candidates rated below this are not hunted
+    fallback_hunts: int = 3  # when none reaches the floor, hunt this many of the best rated 2
 
     def api_key(self) -> str:
         """Read the key from the environment. Never log the return value."""
@@ -157,4 +158,5 @@ def load_config(path: Path) -> Config:
         temperature=_temperature(data),
         max_output_tokens=_positive_int(data, "max_output_tokens", 4000),
         min_coherence=float(data.get("min_coherence", 3.0)),
+        fallback_hunts=int(data.get("fallback_hunts", 3)),
     )

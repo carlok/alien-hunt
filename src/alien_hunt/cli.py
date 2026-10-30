@@ -34,6 +34,7 @@ def _load_known(path: Path) -> list[KnownAdvisory]:
                 class_label=str(entry.get("class") or entry.get("class_label") or ""),
                 symbols=[str(item) for item in entry.get("symbols") or []],
                 cve=entry.get("cve"),
+                classes=[str(item) for item in entry.get("classes") or []],
             )
         )
     return known
@@ -137,6 +138,7 @@ def _run(args: argparse.Namespace) -> int:
         run_id=run_id,
         max_output=config.max_output_tokens,
         min_coherence=config.min_coherence,
+        fallback_hunts=config.fallback_hunts,
     )
     print(report)
     return 0
