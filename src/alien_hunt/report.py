@@ -96,6 +96,7 @@ def render_report(
     pool: list[Candidate] | None = None,
     confirmed_all: int | None = None,
     above_floor: int | None = None,
+    fallback: int = 0,
 ) -> str:
     """Markdown metrics. Reproducers and narratives are not included."""
 
@@ -161,7 +162,7 @@ def render_report(
 Ranked at β = 0.7. The same pool is stored at β = 0.4.
 
 - Coherence ratings parsed: {rated} of {len(pool)} (an unparsed one counts as 1)
-- At or above the coherence floor: {'n/a' if above_floor is None else above_floor} (only those are hunted)
+- At or above the coherence floor: {'n/a' if above_floor is None else above_floor} (only those are hunted{f'; none was, so the best {fallback} rated 2 were' if fallback else ''})
 - Top candidates judged: {len(judged)} of {len(top)} (a hunt that never submitted gives no verdict)
 - Incoherent among them: {incoherent}
 - Miss rate among ratings of 4 or 5: {miss_text}

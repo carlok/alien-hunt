@@ -122,6 +122,7 @@ class KnownAdvisory:
     class_label: str
     symbols: list[str]
     cve: str | None = None
+    classes: list[str] = field(default_factory=list)  # other names for the class a claim may use
 
     def as_dict(self) -> dict:
         return asdict(self)

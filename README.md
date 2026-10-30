@@ -49,6 +49,8 @@ Chat and embeddings both use that OpenAI-compatible endpoint, unless the config 
 
 A review or a hunt gets a last turn that can only submit (on its last round, or once 75% of its token cap is used), and a reply cut at `max_output_tokens` (default 4000) is asked again once, with at most three claims. A coherence batch that does not parse is asked again in halves. The report says how many claims each side made, how many coherence ratings parsed, and how many top candidates got a verdict.
 
+The wheels are for the container's CPython: `container_image` names it (`python:3.12-slim` fetches cp312 wheels). When no candidate reaches `min_coherence`, the best `fallback_hunts` (default 3) rated 2 are hunted instead. A known advisory is cited when a claim's class shares a word with the advisory's `class` or one of its `classes`, and a symbol names one of the claim's functions or files.
+
 Both containers that touch model-written code (the reproducer and the offline wheel install) run with no network, all capabilities dropped, no privilege gain, and a pids and a memory limit.
 
 ## Tests

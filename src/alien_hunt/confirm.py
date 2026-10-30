@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import configparser
 import json
+import os
 import platform
 import re
 import shutil
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from alien_hunt.habits import package_names
+from alien_hunt.habits import package_names, src_layout
 from alien_hunt.types import Claim, Confirmation
 
 _RUNNER = r'''
@@ -203,7 +204,7 @@ def _run_runner(
     runner_path.write_text(_RUNNER, encoding="utf-8")
     env = {
         "PATH": os_path(),
-        "PYTHONPATH": str(checkout),
+        "PYTHONPATH": os.pathsep.join([str(checkout / "src"), str(checkout)] if src_layout(checkout) else [str(checkout)]),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     if extra_env:
@@ -252,6 +253,15 @@ def confirm_local(claim: Claim, checkout: Path, work: Path, *, python: str | Non
     except subprocess.TimeoutExpired:
         return Confirmation(False, "timed out")
     return interpret_run(claim, code, calls, output)
+
+
+def python_tag_for(image: str) -> str:
+    """The CPython wheel tag of a `python:3.X...` image (`docker.io/library/python:3.12-slim` gives `cp312`); cp310 for
+    an image whose name says no version. joserfc needs 3.11 or later, and the run fetched cp310 wheels whatever the
+    container."""
+
+    match = re.search(r"python:3\.(\d+)", image)
+    return f"cp3{match.group(1)}" if match else "cp310"
 
 
 def wheel_compatible(filename: str, python_tag: str = "cp310", arch: str = "x86_64") -> bool:
@@ -588,7 +598,9 @@ def podman_exec_argv(
 ) -> list[str]:
     """Podman invocation: no network, checkout mounted read-only."""
 
-    pythonpath = "/src" if deps is None else "/opt/deps:/src"
+    # The checkout comes first, so an installed package of the same name never shadows the code under review.
+    own = "/src/src:/src" if src_layout(checkout) else "/src"
+    pythonpath = own if deps is None else f"{own}:/opt/deps"
     argv = [
         "podman",
         "run",
