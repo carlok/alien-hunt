@@ -50,6 +50,7 @@ class RunState:
     stopped: bool = False
     error: str | None = None
     confirmed_vectors: list | None = None  # embeddings of the confirmed claims, in order, to merge duplicates
+    hunted: list[Candidate] = field(default_factory=list)  # the candidates actually hunted (at or above the floor)
     above_floor: int | None = None
 
 
@@ -300,6 +301,7 @@ def execute(
         floor = [item for item in state.ranked_07 if (item.coherence or 0) >= min_coherence]
         state.above_floor = len(floor)
         top = floor[:20]
+        state.hunted = top
         for candidate in top:
             if budget.should_stop():
                 raise BudgetStop("hunt")
@@ -373,7 +375,7 @@ def _persist(
 ) -> Path:
     confirmed_pairs = [(claim, confirmation) for claim, confirmation in state.confirmations if confirmation.confirmed]
     confirmed = unique_confirmed(confirmed_pairs, state.confirmed_vectors)
-    top = state.ranked_07[:20]
+    top = state.hunted                      # what was hunted, not the top of the score (#4's first run listed the latter)
     dump_json(
         out_dir / "01-habits.json",
         {

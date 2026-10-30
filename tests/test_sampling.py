@@ -92,3 +92,20 @@ def test_duplicates_are_merged_by_shared_function_and_class_or_alike_text():
     assert [c.origin for c in merged][-1] == "hunt"                 # the two sides are never merged
     assert len(unique_confirmed(pairs)) == 5                       # without vectors, two classes on one function stay apart
     assert unique_confirmed([(claims[0], Confirmation(False, "no"))]) == []
+
+
+def test_the_report_lists_the_hunted_candidates_not_the_top_of_the_score(tmp_path):
+    from test_pipeline import FIXTURE, ScriptedModel
+
+    from alien_hunt.budget import Budget
+    from alien_hunt.config import Prices
+    from alien_hunt.pipeline import execute
+
+    execute(FIXTURE, model=ScriptedModel(), budget=Budget(limit_usd=5), prices=Prices(1, 1, 1), out_dir=tmp_path,
+            sample_limit=1000, confirm_mode="local", scanners=False, run_id="floor")
+    hunts = json.loads((tmp_path / "04-hunts.json").read_text(encoding="utf-8"))
+    records = hunts.get("hunts") if isinstance(hunts, dict) else hunts
+    assert records and all(item["coherence"] >= 3 for item in records)
+    text = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
+    judged = next(line for line in text.splitlines() if line.startswith("- Top candidates judged:"))
+    assert judged.endswith(f"of {len(records)} (a hunt that never submitted gives no verdict)")
