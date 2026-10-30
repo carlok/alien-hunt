@@ -19,8 +19,9 @@ from alien_hunt.confirm import (
     confirm_podman,
     install_wheels,
     prepare_wheels,
+    reproducer_imports,
 )
-from alien_hunt.habits import habit_texts, plain_reviews
+from alien_hunt.habits import habit_texts, package_names, plain_reviews
 from alien_hunt.hunt import directed_hunt
 from alien_hunt.llm import LLMError
 from alien_hunt.redact import redact
@@ -344,7 +345,9 @@ def _confirm(
     work.mkdir(parents=True, exist_ok=True)
     deps = DepsStatus(True, "not requested")
     if mode == "podman":
-        deps = prepare_wheels(checkout, commit_time, work)
+        imports = reproducer_imports([claim.reproducer for claim in state.claims], set(package_names(checkout)))
+        deps = prepare_wheels(checkout, commit_time, work, imports=imports)
+        log.info("dependencies: %s", deps.why)
         if deps.ok and deps.target is not None:
             failure = install_wheels(image, work, deps)
             if failure:

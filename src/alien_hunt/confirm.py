@@ -13,8 +13,10 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tomllib
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -253,19 +255,28 @@ def confirm_local(claim: Claim, checkout: Path, work: Path, *, python: str | Non
 
 
 def wheel_compatible(filename: str, python_tag: str = "cp310", arch: str = "x86_64") -> bool:
-    """Accept a pure-Python wheel or a Linux wheel for the container."""
+    """Accept a pure-Python wheel, or a glibc Linux wheel for the container's CPython and architecture: built for
+    exactly that version, or for the stable ABI (`abi3`) from any earlier 3.x. A musllinux wheel does not run on the
+    container (Debian); cryptography ships only `cp36-abi3` wheels, which the first filter never picked."""
 
     if not filename.endswith(".whl"):
         return False
-    if any(token in filename for token in ("macosx", "win32", "win_amd64")):
+    if any(token in filename for token in ("macosx", "win32", "win_amd64", "musllinux")):
         return False
     if "py3-none-any" in filename or "py2.py3-none-any" in filename:
         return True
-    if python_tag not in filename:
+    if not any(token in filename for token in ("manylinux", "linux_")) or arch not in filename:
         return False
-    if not any(token in filename for token in ("manylinux", "musllinux", "linux_")):
+    parts = filename[:-4].split("-")
+    if len(parts) < 5:
         return False
-    return arch in filename
+    interp, abi = parts[-3], parts[-2]
+    if python_tag in interp.split("."):
+        return True
+    want = int(python_tag[3:]) if python_tag.startswith("cp3") and python_tag[3:].isdigit() else 0
+    return abi == "abi3" and any(
+        tag.startswith("cp3") and tag[3:].isdigit() and int(tag[3:]) <= want for tag in interp.split(".")
+    )
 
 
 def parse_upload_time(value: str | None) -> datetime | None:
@@ -398,42 +409,174 @@ def fetch_pypi_files(name: str) -> list[dict]:
     return pypi_release_files(payload)
 
 
+# Import names that are not their package's name on PyPI.
+IMPORT_TO_DIST = {
+    "yaml": "PyYAML", "Crypto": "pycryptodome", "Cryptodome": "pycryptodomex", "OpenSSL": "pyOpenSSL",
+    "PIL": "Pillow", "dateutil": "python-dateutil", "bs4": "beautifulsoup4", "sklearn": "scikit-learn",
+    "cv2": "opencv-python-headless", "jose": "python-jose", "jwt": "PyJWT", "nacl": "PyNaCl", "magic": "python-magic",
+    "dns": "dnspython", "attr": "attrs", "pkg_resources": "setuptools", "serial": "pyserial", "usb": "pyusb",
+    "zmq": "pyzmq", "google": "protobuf", "markdown": "Markdown", "multipart": "python-multipart",
+}
+
+
+def reproducer_imports(sources: list[str], own: set[str]) -> list[str]:
+    """Top-level names the reproducers import that are neither the standard library nor the repository's own.
+
+    The third PyJWT run's two hunt claims imported `cryptography`, an optional extra the project does not declare as a
+    dependency; nothing installed it, both scripts stopped on the import, and a replay with it confirmed both."""
+
+    names: set[str] = set()
+    for source in sources:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                names.add(node.module.split(".")[0])
+    stdlib = set(getattr(sys, "stdlib_module_names", ()))
+    return sorted(name for name in names if name not in stdlib and name not in own and not name.startswith("_"))
+
+
+def _marker_applies(marker: str) -> bool:
+    """A requirement's environment marker, roughly: no extras, nothing only for Windows or macOS."""
+
+    lowered = marker.lower()
+    return "extra" not in lowered and "win32" not in lowered and "darwin" not in lowered and "windows" not in lowered
+
+
+def fetch_pypi_requires(name: str, version: str) -> list[str]:
+    """Requires-Dist of one release."""
+
+    url = f"https://pypi.org/pypi/{name}/{version}/json"
+    request = urllib.request.Request(url, headers={"User-Agent": "alien-hunt"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.load(response)
+    return list((payload.get("info") or {}).get("requires_dist") or [])
+
+
+def wheel_requires(path: Path) -> list[str]:
+    """Requires-Dist from a wheel's own METADATA. PyPI's JSON leaves them out for some releases: for cryptography
+    35.0.0 it says none, and cffi was never fetched."""
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            name = next((n for n in archive.namelist() if n.count("/") == 1 and n.endswith(".dist-info/METADATA")), None)
+            if name is None:
+                return []
+            text = archive.read(name).decode("utf-8", "replace")
+    except (OSError, zipfile.BadZipFile):
+        return []
+    return [line.split(":", 1)[1].strip() for line in text.splitlines() if line.startswith("Requires-Dist:")]
+
+
+def resolve_wheels(
+    wanted: list[tuple[str, str | None]],
+    commit_time: datetime,
+    *,
+    python_tag: str = "cp310",
+    arch: str | None = None,
+    fetch=None,
+    requires=None,
+    limit: int = 60,
+) -> tuple[list[dict], list[str]]:
+    """The wanted packages and their dependencies, each as the newest compatible wheel uploaded on or before the
+    commit. `requires(item)` gives a chosen wheel's Requires-Dist (default: PyPI's JSON for that version). Returns the
+    chosen file records (with "name") and the names that had none."""
+
+    fetch = fetch or fetch_pypi_files
+    requires = requires or (lambda item: fetch_pypi_requires(item["name"], str(item.get("version") or "")))
+    queue = list(wanted)
+    seen: set[str] = set()
+    chosen: list[dict] = []
+    missing: list[str] = []
+    while queue and len(seen) < limit:
+        name, version = queue.pop(0)
+        key = re.sub(r"[-_.]+", "-", name).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            files = fetch(name)
+        except Exception:
+            missing.append(name)
+            continue
+        item = pick_wheel(files, commit_time, version=version, python_tag=python_tag, arch=arch)
+        if item is None:
+            missing.append(name)
+            continue
+        record = dict(item, name=name)
+        chosen.append(record)
+        try:
+            needs = requires(record)
+        except Exception:
+            needs = []
+        for entry in needs:
+            spec, _, marker = str(entry).partition(";")
+            if marker and not _marker_applies(marker):
+                continue
+            parsed = parse_requirement(spec)
+            if parsed:
+                queue.append((parsed[0], None))
+    return chosen, missing
+
+
 def prepare_wheels(
     root: Path,
     commit_time: datetime,
     work: Path,
     *,
     python_tag: str = "cp310",
+    imports: list[str] | None = None,
+    fetch=None,
+    fetch_requires=None,
+    download=None,
 ) -> DepsStatus:
-    """Download wheels uploaded on or before the commit. Nothing is built from source."""
+    """Download wheels uploaded on or before the commit: the declared dependencies, the third-party packages the
+    reproducers import (`imports`), and their own dependencies. Nothing is built from source. A package with no wheel
+    is named in `why` and left out; the reproducers that need it fail on their own, the others still run."""
 
     deps = dependency_names(root)
+    have = {re.sub(r"[-_.]+", "-", name).lower() for name, _version in deps}
+    for name in imports or []:
+        dist = IMPORT_TO_DIST.get(name, name)
+        if re.sub(r"[-_.]+", "-", dist).lower() not in have:
+            deps.append((dist, None))
+            have.add(re.sub(r"[-_.]+", "-", dist).lower())
     if not deps:
         return DepsStatus(True, "no third-party dependencies")
     wheels = work / "wheels"
     wheels.mkdir(parents=True, exist_ok=True)
     target = work / "deps"
     target.mkdir(parents=True, exist_ok=True)
-    for name, version in deps:
-        try:
-            files = fetch_pypi_files(name)
-        except Exception as exc:
-            return DepsStatus(False, f"could not read the package index for {name}: {exc}")
-        chosen = pick_wheel(files, commit_time, version=version, python_tag=python_tag)
-        if chosen is None:
-            return DepsStatus(False, f"no compatible wheel for {name} on or before the commit")
-        link = str(chosen.get("url") or "")
-        if not link.startswith("https://"):
-            return DepsStatus(False, f"refusing non-https wheel url for {name}")
-        filename = str(chosen.get("filename") or "package.whl")
-        destination = wheels / filename
-        try:
-            urllib.request.urlretrieve(link, destination)
-        except Exception as exc:
-            return DepsStatus(False, f"could not download a wheel for {name}: {exc}")
+    download = download or urllib.request.urlretrieve
+    fetch_requires = fetch_requires or fetch_pypi_requires
+    downloaded: set[str] = set()
+
+    def requires(item: dict) -> list[str]:
+        """Download the chosen wheel now and read its own Requires-Dist; PyPI's JSON only when it has none."""
+
+        link = str(item.get("url") or "")
+        path = wheels / Path(str(item.get("filename") or "package.whl")).name
+        if link.startswith("https://"):
+            try:
+                download(link, path)
+                downloaded.add(item["name"])
+            except Exception:
+                pass
+        return wheel_requires(path) or fetch_requires(item["name"], str(item.get("version") or ""))
+
+    chosen, missing = resolve_wheels(deps, commit_time, python_tag=python_tag, fetch=fetch, requires=requires)
+    names = [item["name"] for item in chosen if item["name"] in downloaded]
+    missing += [item["name"] for item in chosen if item["name"] not in downloaded]
+    if not names:
+        return DepsStatus(False, "no wheel for any dependency on or before the commit: " + ", ".join(missing[:10]))
     requirements = work / "requirements.txt"
-    requirements.write_text("\n".join(name for name, _version in deps) + "\n", encoding="utf-8")
-    return DepsStatus(True, "wheels downloaded", target)
+    requirements.write_text("\n".join(names) + "\n", encoding="utf-8")
+    why = "wheels downloaded" + (f"; none for {', '.join(missing[:10])}" if missing else "")
+    return DepsStatus(True, why, target)
 
 
 def podman_exec_argv(
@@ -507,6 +650,7 @@ def podman_pip_argv(image: str, wheels: Path, deps: Path, requirements: Path) ->
         "install",
         "--disable-pip-version-check",
         "--no-index",
+        "--no-deps",
         "--only-binary=:all:",
         "--find-links",
         "/wheels",
