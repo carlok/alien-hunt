@@ -109,3 +109,40 @@ def test_the_report_lists_the_hunted_candidates_not_the_top_of_the_score(tmp_pat
     text = (tmp_path / "REPORT.md").read_text(encoding="utf-8")
     judged = next(line for line in text.splitlines() if line.startswith("- Top candidates judged:"))
     assert judged.endswith(f"of {len(records)} (a hunt that never submitted gives no verdict)")
+
+
+def test_input_sized_loops_and_decodes_are_sinks(tmp_path: Path):
+    """joserfc's advisories: a JWE recipients list processed in full, and compact segments split and decoded before the
+    size check. The first sinks (eval, pickle, a multiplication) gave the hunts nothing there."""
+    from alien_hunt.atoms import extract_atoms
+
+    pkg = tmp_path / "jose"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "json.py").write_text(
+        "import base64\n"
+        "def extract_general_json(data, registry):\n"
+        "    out = [r for r in data['recipients']]\n"
+        "    for key, value in registry.items():\n"
+        "        pass\n"
+        "    for n in range(10):\n"
+        "        pass\n"
+        "    return out\n"
+        "def extract_compact(value, registry):\n"
+        "    parts = value.split(b'.')\n"
+        "    header = base64.urlsafe_b64decode(value)\n"
+        "    return parts, header\n"
+        "class R:\n"
+        "    def check(self, items):\n"
+        "        for x in self.cache:\n"
+        "            pass\n", encoding="utf-8")
+    _sources, sinks, _invariants, mechanisms = extract_atoms(tmp_path)
+    texts = sorted(s.text for s in sinks if "caller-supplied" in s.text)
+    assert texts == [
+        "base64 decode of caller-supplied value in extract_compact",
+        "loop over caller-supplied data['recipients'] in extract_general_json",
+        "loop over caller-supplied registry.items() in extract_general_json",
+        "split of caller-supplied value in extract_compact",
+    ]
+    assert all(s.file == "jose/json.py" for s in sinks)            # co-located with the functions' own arguments
+    assert any("before its length is checked" in m.text for m in mechanisms)

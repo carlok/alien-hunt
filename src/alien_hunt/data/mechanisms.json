@@ -58,5 +58,7 @@
   "A privilege drop happens after the privileged work, or is skipped on one branch.",
   "Versions or ranges are compared with string order.",
   "A missing field skips a check that a present field would have failed.",
-  "A retry repeats an action that already took effect."
+  "A retry repeats an action that already took effect.",
+  "A collection taken from the input is processed in full before its length is checked, so one request costs work in proportion to a size the caller picks.",
+  "Input is decoded, split or decompressed before its size is checked, so memory in proportion to the caller's input is allocated first."
 ]

@@ -20,10 +20,10 @@ def test_semgrep_command_uses_only_local_rules(tmp_path: Path):
 
 def test_mechanisms_are_original_and_numerous():
     mechanisms = load_mechanisms()
-    assert len(mechanisms) == 60
+    assert len(mechanisms) == 62
     assert mechanisms[0].id == "m01"
     texts = [item.text for item in mechanisms]
-    assert len(set(texts)) == 60
+    assert len(set(texts)) == 62
     blob = "\n".join(texts).lower()
     assert "cwe-" not in blob
 
