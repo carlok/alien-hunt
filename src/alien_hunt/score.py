@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+from pathlib import Path
 
 from alien_hunt.types import Atom, Candidate
 
@@ -100,6 +101,34 @@ def sample_triples(
     for index, candidate in enumerate(pool):
         candidate.id = f"c{index:03d}"
     return pool
+
+
+def _top_dir(path: str | None) -> str:
+    parts = Path(path or "").parts
+    return parts[0] if len(parts) > 1 else "."
+
+
+def colocated_pairs(sources: list[Atom], others: list[Atom], *, limit: int, seed: int) -> list[tuple[Atom, Atom]]:
+    """(source, sink-or-invariant) pairs that live together: the same file first, then the same top-level folder.
+
+    Uniform triples were almost never coherent on PyJWT (74 of 80 rated 1): a source and a sink from two unrelated
+    files rarely meet on a real path. At most `limit` pairs; a larger group is sampled with `seed`."""
+
+    same_file = [(s, o) for s in sources for o in others if s.file and s.file == o.file]
+    same_dir = [
+        (s, o)
+        for s in sources
+        for o in others
+        if s.file and o.file and s.file != o.file and _top_dir(s.file) == _top_dir(o.file)
+    ]
+    rng = random.Random(seed)
+    picked: list[tuple[Atom, Atom]] = []
+    for group in (same_file, same_dir):
+        need = limit - len(picked)
+        if need <= 0:
+            break
+        picked.extend(group if len(group) <= need else rng.sample(group, need))
+    return picked
 
 
 def coherence_miss_rate(top: list[Candidate]) -> float | None:

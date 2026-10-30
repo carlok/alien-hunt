@@ -11,6 +11,9 @@ from alien_hunt.types import Atom
 
 _PROMISE = re.compile(r"\b(must|never|always|equals|at least|at most|length)\b", re.IGNORECASE)
 _SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "build", "dist"}
+# Atoms come from the library itself: a test's argument or the docs' config is no entry point anyone reaches.
+_NOT_LIBRARY_DIRS = {"tests", "test", "testing", "docs", "doc", "examples", "example", "benchmarks", "scripts"}
+_NOT_LIBRARY_FILES = {"setup.py", "conftest.py", "noxfile.py", "fabfile.py"}
 
 _SINK_NAMES = {
     "eval": "eval of an expression",
@@ -45,7 +48,11 @@ def load_mechanisms() -> list[Atom]:
 def _py_files(root: Path) -> list[Path]:
     files = []
     for path in sorted(root.rglob("*.py")):
-        if any(part in _SKIP_DIRS for part in path.parts):
+        parts = path.relative_to(root).parts            # the checkout's own folders only, not the ones above it
+        if any(part in _SKIP_DIRS or part in _NOT_LIBRARY_DIRS for part in parts[:-1]):
+            continue
+        name = parts[-1]
+        if name in _NOT_LIBRARY_FILES or name.startswith("test_") or name.endswith("_test.py"):
             continue
         if path.stat().st_size > 500_000:
             continue

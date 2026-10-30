@@ -24,3 +24,8 @@ container_image = "docker.io/library/python:3.10-slim"
 
 # The limit on one reply: a review's claims with their reproducers, or a batch of coherence ratings.
 # max_output_tokens = 4000
+
+# Candidates rated below this (1 to 5) are not hunted.
+# min_coherence = 3
+# Candidates in the pool (4 per co-located pair).
+# sample_limit = 80

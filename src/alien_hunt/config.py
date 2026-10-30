@@ -53,6 +53,7 @@ class Config:
     embedding: Endpoint | None = None
     temperature: float | None = 0.0  # None: the parameter is not sent (some models refuse it)
     max_output_tokens: int = 4000  # one reply's limit: a review's claims with reproducers, a batch of ratings
+    min_coherence: float = 3.0  # candidates rated below this are not hunted
 
     def api_key(self) -> str:
         """Read the key from the environment. Never log the return value."""
@@ -155,4 +156,5 @@ def load_config(path: Path) -> Config:
         coherence_batch=_positive_int(data, "coherence_batch", 10),
         temperature=_temperature(data),
         max_output_tokens=_positive_int(data, "max_output_tokens", 4000),
+        min_coherence=float(data.get("min_coherence", 3.0)),
     )
