@@ -21,3 +21,6 @@ container_image = "docker.io/library/python:3.10-slim"
 
 # Sent with every chat request; `false` leaves it out, for a model that refuses it.
 # temperature = 0
+
+# The limit on one reply: a review's claims with their reproducers, or a batch of coherence ratings.
+# max_output_tokens = 4000

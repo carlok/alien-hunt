@@ -52,6 +52,7 @@ class Config:
     coherence_batch: int = 10
     embedding: Endpoint | None = None
     temperature: float | None = 0.0  # None: the parameter is not sent (some models refuse it)
+    max_output_tokens: int = 4000  # one reply's limit: a review's claims with reproducers, a batch of ratings
 
     def api_key(self) -> str:
         """Read the key from the environment. Never log the return value."""
@@ -153,4 +154,5 @@ def load_config(path: Path) -> Config:
         sample_limit=_positive_int(data, "sample_limit", 80),
         coherence_batch=_positive_int(data, "coherence_batch", 10),
         temperature=_temperature(data),
+        max_output_tokens=_positive_int(data, "max_output_tokens", 4000),
     )

@@ -135,6 +135,7 @@ def _run(args: argparse.Namespace) -> int:
         commit=commit,
         secret=secret,
         run_id=run_id,
+        max_output=config.max_output_tokens,
     )
     print(report)
     return 0

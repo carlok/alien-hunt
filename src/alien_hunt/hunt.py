@@ -54,12 +54,18 @@ def hunt_prompt(candidate: Candidate) -> str:
 
 
 def judge_coherence(candidate: Candidate, result: AgentResult, root: Path) -> None:
-    """A candidate is incoherent when the hunt denies the path, or every named function is missing."""
+    """A candidate is incoherent when the hunt denies the path, or every named function is missing. A hunt that never
+    submitted gives no verdict (None), unless the named functions are all missing."""
 
     candidate.path_exists = result.path_exists
     named = candidate.named_functions
     missing = bool(named) and all(not function_exists(root, name) for name in named)
-    candidate.incoherent = result.path_exists is False or missing
+    if missing or result.path_exists is False:
+        candidate.incoherent = True
+    elif result.submitted:
+        candidate.incoherent = False
+    else:
+        candidate.incoherent = None
 
 
 def directed_hunt(
@@ -69,6 +75,7 @@ def directed_hunt(
     *,
     rounds: int,
     token_cap: int,
+    max_output: int = 4000,
 ) -> AgentResult:
     """One focused review for a single candidate."""
 
@@ -83,6 +90,7 @@ def directed_hunt(
         max_claims=10,
         token_cap=token_cap,
         candidate_id=candidate.id,
+        max_output=max_output,
     )
     judge_coherence(candidate, result, root)
     return result

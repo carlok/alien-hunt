@@ -39,6 +39,7 @@ def plain_reviews(
     *,
     rounds: int,
     passes: int = 3,
+    max_output: int = 4000,
 ) -> list[Claim]:
     """Run the same plain review `passes` times."""
 
@@ -60,6 +61,7 @@ def plain_reviews(
             max_rounds=rounds,
             max_claims=10,
             token_cap=None,
+            max_output=max_output,
         )
         claims.extend(result.claims[:10])
     return claims
