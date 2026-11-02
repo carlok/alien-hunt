@@ -84,6 +84,9 @@ def main(argv: list[str] | None = None) -> int:
     except LLMError as exc:
         print(f"alien-hunt: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print("alien-hunt: interrupted", file=sys.stderr)
+        return 130
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -126,6 +129,7 @@ def _run(args: argparse.Namespace) -> int:
         seed=args.seed,
         sample_limit=config.sample_limit,
         review_rounds=config.max_tool_rounds_review,
+        plain_temperature=config.plain_temperature,
         hunt_rounds=config.max_tool_rounds_hunt,
         hunt_token_cap=config.max_tokens_per_hunt,
         coherence_batch=config.coherence_batch,

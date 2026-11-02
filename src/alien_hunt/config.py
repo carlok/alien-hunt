@@ -52,6 +52,7 @@ class Config:
     coherence_batch: int = 10
     embedding: Endpoint | None = None
     temperature: float | None = 0.0  # None: the parameter is not sent (some models refuse it)
+    plain_temperature: float | None = 0.8  # the plain reviews' own; None: they use `temperature`
     max_output_tokens: int = 4000  # one reply's limit: a review's claims with reproducers, a batch of ratings
     min_coherence: float = 3.0  # candidates rated below this are not hunted
     fallback_hunts: int = 3  # when none reaches the floor, hunt this many of the best rated 2
@@ -125,16 +126,17 @@ def _positive_int(data: dict, key: str, default: int | None = None) -> int:
     return number
 
 
-def _temperature(data: dict) -> float | None:
-    """0 when absent, as before; `temperature = false` leaves the parameter out of every chat request."""
+def _temperature(data: dict, key: str = "temperature", default: float = 0.0) -> float | None:
+    """`temperature`: 0 when absent, as before; `false` leaves the parameter out of every chat request.
+    `plain_temperature`: 0.8 when absent; `false` means the plain reviews use `temperature` like every other stage."""
 
-    if "temperature" not in data:
-        return 0.0
-    value = data["temperature"]
+    if key not in data:
+        return default
+    value = data[key]
     if value is False:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 2:
-        raise ConfigError("temperature must be a number from 0 to 2, or false to leave it out")
+        raise ConfigError(f"{key} must be a number from 0 to 2, or false")
     return float(value)
 
 
@@ -176,6 +178,7 @@ def load_config(path: Path) -> Config:
         sample_limit=_positive_int(data, "sample_limit", 80),
         coherence_batch=_positive_int(data, "coherence_batch", 10),
         temperature=_temperature(data),
+        plain_temperature=_temperature(data, "plain_temperature", 0.8),
         max_output_tokens=_positive_int(data, "max_output_tokens", 4000),
         min_coherence=_rating(data, "min_coherence", 3.0),
         fallback_hunts=_count(data, "fallback_hunts", 3),

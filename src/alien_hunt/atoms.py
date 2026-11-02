@@ -10,7 +10,7 @@ from pathlib import Path
 from alien_hunt.types import Atom
 
 _PROMISE = re.compile(r"\b(must|never|always|equals|at least|at most|length)\b", re.IGNORECASE)
-_SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "build", "dist"}
+_SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "build", "dist", ".tox", ".eggs", "node_modules", "site-packages"}
 # Atoms come from the library itself: a test's argument or the docs' config is no entry point anyone reaches.
 _NOT_LIBRARY_DIRS = {"tests", "test", "testing", "docs", "doc", "examples", "example", "benchmarks", "scripts"}
 _NOT_LIBRARY_FILES = {"setup.py", "conftest.py", "noxfile.py", "fabfile.py"}
@@ -48,6 +48,8 @@ def load_mechanisms() -> list[Atom]:
 def _py_files(root: Path) -> list[Path]:
     files = []
     for path in sorted(root.rglob("*.py")):
+        if path.is_symlink() or not path.is_file():     # a link can point anywhere the process can read, or nowhere
+            continue
         parts = path.relative_to(root).parts            # the checkout's own folders only, not the ones above it
         if any(part in _SKIP_DIRS or part in _NOT_LIBRARY_DIRS for part in parts[:-1]):
             continue
@@ -124,7 +126,8 @@ def _input_sinks(func: ast.AST, relative: str) -> list[Atom]:
             if _rooted_in(it, params):
                 expr = ast.unparse(it)[:60]
                 out.append(Atom(kind="sink", id=f"sink-{relative}-{func.name}-loop-{getattr(it, 'lineno', 0)}",
-                                text=f"loop over caller-supplied {expr} in {func.name}", file=relative, function=func.name))
+                                text=f"loop over caller-supplied {expr} in {func.name}", file=relative, function=func.name,
+                                line=getattr(it, "lineno", None)))
         if isinstance(node, ast.Call):
             name = _call_name(node)
             label = _DECODERS.get(name)
@@ -136,7 +139,8 @@ def _input_sinks(func: ast.AST, relative: str) -> list[Atom]:
             if label and arg is not None and _rooted_in(arg, params):
                 expr = ast.unparse(arg)[:60]
                 out.append(Atom(kind="sink", id=f"sink-{relative}-{func.name}-{label}-{getattr(node, 'lineno', 0)}",
-                                text=f"{label} of caller-supplied {expr} in {func.name}", file=relative, function=func.name))
+                                text=f"{label} of caller-supplied {expr} in {func.name}", file=relative, function=func.name,
+                                line=getattr(node, "lineno", None)))
     return out
 
 
@@ -186,6 +190,7 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
                             text=f"caller argument {arg.arg} of {node.name}",
                             file=relative,
                             function=node.name,
+                            line=node.lineno,
                         ),
                     )
                 doc = ast.get_docstring(node)
@@ -201,6 +206,7 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
                                 text=sentence,
                                 file=relative,
                                 function=node.name,
+                                line=node.lineno,
                             ),
                         )
             if isinstance(node, ast.Call):
@@ -214,6 +220,7 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
                             text=f"{_SINK_NAMES[name]} in {relative}",
                             file=relative,
                             function=name,
+                            line=getattr(node, "lineno", None),
                         ),
                     )
             if isinstance(node, ast.Subscript):
@@ -231,6 +238,7 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
                             id=f"src-{relative}-environ-{getattr(node, 'lineno', 0)}",
                             text=f"environment variable read in {relative}",
                             file=relative,
+                            line=getattr(node, "lineno", None),
                         ),
                     )
             if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
@@ -242,6 +250,7 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
                             id=f"src-{relative}-argv",
                             text=f"command line argv in {relative}",
                             file=relative,
+                            line=getattr(node, "lineno", None),
                         ),
                     )
             if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
@@ -253,6 +262,7 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
                         text=f"size multiplication in {relative}",
                         file=relative,
                         function="multiplication",
+                        line=getattr(node, "lineno", None),
                     ),
                 )
     return (

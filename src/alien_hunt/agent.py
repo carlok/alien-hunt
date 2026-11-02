@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from alien_hunt.budget import Budget, BudgetStop
 from alien_hunt.config import Prices
+from alien_hunt.prompts import MARKER
 from alien_hunt.types import ChatResponse, Claim, ToolCall
+
+log = logging.getLogger("alien_hunt")
 
 _MAX_OUTPUT = 8000
 _SEARCH_HITS = 50
 _LIST_LIMIT = 200
+_LINE_CHARS = 500
 
 
 class SandboxError(Exception):
@@ -68,8 +73,20 @@ def read_file(root: Path, user_path: str, start_line: int = 1, line_cap: int = 2
     return "\n".join(numbered)
 
 
+def _check_glob(glob: str) -> str:
+    """The glob is the model's choice: pathlib raises on an absolute one, and `..` walks out of the tree."""
+
+    if not glob or len(glob) > 100 or glob.startswith(("/", "\\")) or ".." in Path(glob).parts:
+        raise SandboxError("glob must be a relative pattern such as *.py")
+    return glob
+
+
 def search(root: Path, pattern: str, glob: str = "*.py") -> str:
-    """Search text files inside the checkout. At most 50 hits."""
+    """Search text files inside the checkout. At most 50 hits.
+
+    Symlinks are skipped, and so is anything that resolves outside the checkout: a link in an untrusted tree can point
+    at any file the process can read, and the hits go to the model endpoint. Only the start of a long line is matched,
+    which bounds what a model-written pattern can cost on a minified file; it does not stop a pathological pattern."""
 
     if not pattern or len(pattern) > 200:
         raise SandboxError("pattern must be 1 to 200 characters")
@@ -79,20 +96,20 @@ def search(root: Path, pattern: str, glob: str = "*.py") -> str:
         raise SandboxError(f"invalid pattern: {exc}") from exc
     base = root.resolve()
     hits: list[str] = []
-    for path in sorted(base.rglob(glob)):
-        if not path.is_file():
+    for path in sorted(base.rglob(_check_glob(glob))):
+        if path.is_symlink() or not path.is_file():
             continue
-        if ".git" in path.parts:
-            continue
-        if path.stat().st_size > 1_000_000:
+        relative = path.relative_to(base)
+        if ".git" in relative.parts:
             continue
         try:
+            if base not in path.resolve().parents or path.stat().st_size > 1_000_000:
+                continue
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         for number, line in enumerate(text.splitlines(), start=1):
-            if compiled.search(line):
-                relative = path.relative_to(base)
+            if compiled.search(line[:_LINE_CHARS]):
                 hits.append(f"{relative}:{number}:{line[:200]}")
                 if len(hits) >= _SEARCH_HITS:
                     return "\n".join(hits)
@@ -136,7 +153,7 @@ TOOLS: list[dict] = [
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string"},
-                    "glob": {"type": "string"},
+                    "glob": {"type": "string", "description": "A relative pattern, *.py by default."},
                 },
                 "required": ["pattern"],
             },
@@ -160,7 +177,11 @@ TOOLS: list[dict] = [
                                 "class": {"type": "string"},
                                 "files": {"type": "array", "items": {"type": "string"}},
                                 "functions": {"type": "array", "items": {"type": "string"}},
-                                "reproducer": {"type": "string"},
+                                "reproducer": {
+                                    "type": "string",
+                                    "description": f"Prints {MARKER} from an if or except branch and exits 0 only when "
+                                    "the call showed the defect; otherwise exits 1.",
+                                },
                             },
                             "required": ["text", "class", "files", "functions", "reproducer"],
                         },
@@ -180,9 +201,14 @@ CUT_SHORT = (
     "Your last reply was cut at the length limit, so it was not received. Call submit_claims again with at most "
     "3 claims and short reproducers."
 )
+BAD_SUBMIT = "error: {problem} Call submit_claims again with at most 3 claims and short reproducers."
 
 
 def _run_tool(root: Path, call: ToolCall, line_cap: int) -> str:
+    """A tool's error goes back to the model as text. Its arguments are the model's, so anything may raise."""
+
+    if call.invalid:
+        return "error: the arguments were not valid JSON"
     try:
         name = call.name
         args = call.arguments
@@ -198,7 +224,7 @@ def _run_tool(root: Path, call: ToolCall, line_cap: int) -> str:
         if name == "search":
             return search(root, str(args.get("pattern", "")), str(args.get("glob", "*.py") or "*.py"))
         return f"unknown tool {name}"
-    except (SandboxError, OSError, ValueError) as exc:
+    except Exception as exc:
         return f"error: {exc}"
 
 
@@ -232,6 +258,23 @@ def parse_claims(payload: dict, *, origin: str, candidate_id: str | None, max_cl
     return claims
 
 
+def _submit_problem(call: ToolCall, claims: list[Claim]) -> str | None:
+    """Why a submit_claims call cannot be taken at its word, or None. An unreadable call is not an empty submission:
+    reading it as one loses a paid review and, in a hunt, gives a verdict nobody reached. Denying the path with no
+    claims list is a fair answer."""
+
+    if call.invalid:
+        return "the arguments were not valid JSON, probably cut off."
+    raw = call.arguments.get("claims")
+    if raw is None and "path_exists" in call.arguments:
+        return None
+    if not isinstance(raw, list):
+        return "claims must be a list."
+    if raw and not claims:
+        return "no claim had both text and a reproducer."
+    return None
+
+
 @dataclass
 class AgentResult:
     """Claims submitted by one review, plus the model's path judgement."""
@@ -251,10 +294,13 @@ class PaidModel:
         self.budget = budget
         self.prices = prices
 
-    def chat(self, *, stage: str, messages: list, tools: list | None, max_tokens: int) -> ChatResponse:
+    def chat(
+        self, *, stage: str, messages: list, tools: list | None, max_tokens: int, temperature: float | None = None
+    ) -> ChatResponse:
         if self.budget.should_stop():
             raise BudgetStop(stage)
-        response = self.inner.chat(messages=messages, tools=tools, max_tokens=max_tokens)
+        sampling = {} if temperature is None else {"temperature": temperature}
+        response = self.inner.chat(messages=messages, tools=tools, max_tokens=max_tokens, **sampling)
         self.budget.charge_tokens(
             stage,
             response.prompt_tokens,
@@ -293,12 +339,15 @@ def run_agent(
     candidate_id: str | None = None,
     line_cap: int = 200,
     max_output: int = 4000,
+    temperature: float | None = None,
 ) -> AgentResult:
     """Run a review until it submits claims, runs out of rounds, or hits the token cap.
 
     The last round (by count, or once 75% of the token cap is used) offers submit_claims alone and says so, so a
     review that explored until the end still answers. A reply cut at `max_output` is not trusted (its tool call may
-    be truncated JSON): the model is asked once more for fewer, shorter claims, with submit_claims alone."""
+    be truncated JSON), and neither is a submit that cannot be read, whatever the finish reason says: either way the
+    model is asked once more for fewer, shorter claims, with submit_claims alone. A second failure means no submission
+    (`submitted` stays False), not an empty one."""
 
     messages: list[dict] = [
         {"role": "system", "content": system},
@@ -306,6 +355,7 @@ def run_agent(
     ]
     result = AgentResult()
     force, allowed, retried = False, max_rounds, False
+    sampling = {} if temperature is None else {"temperature": temperature}
     while result.rounds < allowed:
         if token_cap is not None and result.tokens >= token_cap and not retried:
             break
@@ -314,7 +364,7 @@ def run_agent(
             messages.append({"role": "user", "content": LAST_TURN})
             force = True
         response = model.chat(
-            stage=stage, messages=messages, tools=SUBMIT_ONLY if last else TOOLS, max_tokens=max_output
+            stage=stage, messages=messages, tools=SUBMIT_ONLY if last else TOOLS, max_tokens=max_output, **sampling
         )
         result.rounds += 1
         result.tokens += response.prompt_tokens + response.completion_tokens
@@ -330,16 +380,22 @@ def run_agent(
         others = [call for call in response.tool_calls if call.name != "submit_claims"]
         if submits:
             payload = submits[0].arguments
-            result.submitted = True
-            if "path_exists" in payload:
-                result.path_exists = bool(payload.get("path_exists"))
-            result.claims = parse_claims(
-                payload,
-                origin=origin,
-                candidate_id=candidate_id,
-                max_claims=max_claims,
-            )
-            return result
+            claims = parse_claims(payload, origin=origin, candidate_id=candidate_id, max_claims=max_claims)
+            problem = _submit_problem(submits[0], claims)
+            if problem is None:
+                result.submitted = True
+                if "path_exists" in payload:
+                    result.path_exists = bool(payload.get("path_exists"))
+                result.claims = claims
+                return result
+            log.info("%s: a submit_claims call could not be read: %s", stage, problem)
+            if retried:
+                break
+            retried = True
+            allowed = max(allowed, result.rounds + 1)
+            messages.append({"role": "user", "content": BAD_SUBMIT.format(problem=problem)})
+            force = True
+            continue
         if not others:
             if last:
                 break

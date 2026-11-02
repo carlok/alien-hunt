@@ -49,20 +49,25 @@ class OpenAIModel:
     def __repr__(self) -> str:
         return f"OpenAIModel(model={self.model!r}, base_url={self.base_url!r})"
 
-    def chat(self, *, messages: list, tools: list | None, max_tokens: int) -> ChatResponse:
+    def chat(self, *, messages: list, tools: list | None, max_tokens: int, temperature: float | None = None) -> ChatResponse:
+        """One chat turn. `temperature` overrides the configured one for this turn, but `temperature = false` in the
+        config wins over everything: an endpoint that refuses the parameter must never see it."""
+
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
         }
         if self.temperature is not None:
-            kwargs["temperature"] = self.temperature
+            kwargs["temperature"] = self.temperature if temperature is None else temperature
         if tools:
             kwargs["tools"] = tools
         try:
             response = self._client.chat.completions.create(**kwargs)
         except Exception as exc:
             raise LLMError(str(redact(str(exc), self._secret))) from None
+        if not response.choices:
+            raise LLMError("the model returned no choices")
         finish_reason = getattr(response.choices[0], "finish_reason", None)
         choice = response.choices[0].message
         tool_calls: list[ToolCall] = []
@@ -71,10 +76,11 @@ class OpenAIModel:
             try:
                 arguments = json.loads(raw)
             except json.JSONDecodeError:
-                arguments = {}
-            if not isinstance(arguments, dict):
-                arguments = {}
-            tool_calls.append(ToolCall(id=call.id, name=call.function.name, arguments=arguments))
+                arguments = None
+            invalid = not isinstance(arguments, dict)   # not the same as a call that asks for nothing
+            tool_calls.append(
+                ToolCall(id=call.id, name=call.function.name, arguments={} if invalid else arguments, invalid=invalid)
+            )
         usage = response.usage
         text = choice.content or ""
         if usage is None:

@@ -99,6 +99,6 @@ def test_the_local_runner_sees_a_src_layout(tmp_path):
     (root / "src" / "pkg" / "__init__.py").write_text("def f():\n    return 1\n", encoding="utf-8")
     import sys
 
-    code, calls, output = _run_runner(root, "import pkg\nimport sys\nsys.exit(0 if pkg.f() == 1 else 1)\n", tmp_path / "w",
+    code, calls, output, _marker = _run_runner(root, "import pkg\nimport sys\nsys.exit(0 if pkg.f() == 1 else 1)\n", tmp_path / "w",
                                       python=sys.executable)
     assert code == 0, output

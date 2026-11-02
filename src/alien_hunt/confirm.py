@@ -1,14 +1,21 @@
 """Confirm a claim by running its reproducer.
 
-The script must import and call the checkout. Reading source text does not count.
-The CLI runs that script in Podman with the network off and the checkout read-only.
+The script must import the checkout, enter a function the claim names, print the defect marker from a branch, and
+exit 0. Reading source text does not count. The CLI runs that script in Podman with the network off and the checkout
+read-only.
+
+The trace and the reproducer share one process, so a script written to fool the trace could. The blocked modules and
+attributes stop the obvious routes, and the marker asks the script to test something; neither makes the check
+adversary-proof, and a broad `except` around a call that raises still counts as a branch.
 """
 
 from __future__ import annotations
 
 import ast
 import configparser
+import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -17,13 +24,17 @@ import subprocess
 import sys
 import tomllib
 import urllib.request
+import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from alien_hunt.habits import package_names, src_layout
+from alien_hunt.prompts import BLOCKED_ATTRS, BLOCKED_MODULES, MARKER
 from alien_hunt.types import Claim, Confirmation
+
+log = logging.getLogger("alien_hunt")
 
 _RUNNER = r'''
 import json
@@ -43,7 +54,7 @@ def tracer(frame, event, arg):
         except OSError:
             resolved = filename
         inside = resolved == root or resolved.startswith(root + os.sep)
-        if inside and frame.f_code.co_name != "<module>":
+        if inside and frame.f_code.co_flags & 1:  # CO_OPTIMIZED: a function, not a module or class body run by the import
             calls.append(f"{resolved}:{frame.f_code.co_name}")
     return tracer
 
@@ -72,12 +83,13 @@ finally:
 raise SystemExit(status)
 '''
 
-# Model-written code runs in these containers: no capabilities, no privilege gain, bounded processes and memory.
+# Model-written code runs in these containers: no capabilities, no privilege gain, bounded processes, memory and CPU.
 HARDENING = (
     "--cap-drop=all",
     "--security-opt=no-new-privileges",
     "--pids-limit=256",
     "--memory=2g",
+    "--cpus=1",
 )
 
 _REQ = re.compile(r"^([A-Za-z0-9_.-]+)\s*(?:==\s*([A-Za-z0-9_.*+-]+))?")
@@ -103,8 +115,51 @@ def linux_arch() -> str:
     return machine
 
 
+def _decides_nothing(test: ast.expr) -> bool:
+    """`if __name__ == "__main__"` always runs (the runner executes the script as __main__), and so does `if True`."""
+
+    if isinstance(test, ast.Constant):
+        return True
+    return isinstance(test, ast.Compare) and any(
+        isinstance(side, ast.Name) and side.id == "__name__" for side in (test.left, *test.comparators)
+    )
+
+
+def _marker_is_conditional(tree: ast.AST) -> bool:
+    """True when a print call that names the marker sits in an `if` body or `else`, an `except`, or a `try`'s `else`
+    (the call raised nothing, which is the defect when it should have refused the input). A print after a call in the
+    body of a `try` with a handler says the same as that `else`: the call raising skips it."""
+
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print"):
+            continue
+        if not any(
+            isinstance(part, ast.Constant) and isinstance(part.value, str) and MARKER in part.value
+            for arg in node.args
+            for part in ast.walk(arg)
+        ):
+            continue
+        child: ast.AST = node
+        parent = parents.get(node)
+        while parent is not None:
+            if isinstance(parent, ast.If) and not _decides_nothing(parent.test):
+                return True
+            if isinstance(parent, ast.ExceptHandler):
+                return True
+            if isinstance(parent, (ast.Try, ast.TryStar)) and child in parent.orelse:
+                return True
+            if isinstance(parent, (ast.Try, ast.TryStar)) and parent.handlers and child in parent.body:
+                earlier = parent.body[: parent.body.index(child)]
+                if any(isinstance(part, ast.Call) for statement in earlier for part in ast.walk(statement)):
+                    return True
+            child, parent = parent, parents.get(parent)
+    return False
+
+
 def ast_block_reason(source: str, packages: set[str]) -> str | None:
-    """Reject reproducers that do not call the repository, or that read its source."""
+    """Reject reproducers that do not call the repository, read its source, get around the trace, or print no marker
+    from a branch. Decided before anything runs."""
 
     try:
         tree = ast.parse(source)
@@ -113,25 +168,31 @@ def ast_block_reason(source: str, packages: set[str]) -> str | None:
     module_aliases: set[str] = set()
     func_aliases: set[str] = set()
     reads_source = False
+    blocked = False
     has_import = False
     has_call = False
 
     class Scanner(ast.NodeVisitor):
         def visit_Import(self, node: ast.Import) -> None:
-            nonlocal has_import
+            nonlocal has_import, blocked
             for alias in node.names:
                 root_name = alias.name.split(".")[0]
                 if root_name in packages:
                     has_import = True
                     module_aliases.add(alias.asname or root_name)
+                elif root_name in BLOCKED_MODULES:
+                    blocked = True
             self.generic_visit(node)
 
         def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            nonlocal has_import
-            if node.module and node.module.split(".")[0] in packages:
+            nonlocal has_import, blocked
+            root_name = (node.module or "").split(".")[0]
+            if root_name in packages:
                 has_import = True
                 for alias in node.names:
                     func_aliases.add(alias.asname or alias.name)
+            elif root_name in BLOCKED_MODULES or any((root_name, alias.name) in BLOCKED_ATTRS for alias in node.names):
+                blocked = True
             self.generic_visit(node)
 
         def visit_Call(self, node: ast.Call) -> None:
@@ -139,15 +200,20 @@ def ast_block_reason(source: str, packages: set[str]) -> str | None:
             func = node.func
             if isinstance(func, ast.Name) and func.id in func_aliases:
                 has_call = True
-            elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-                if func.value.id in module_aliases and func.attr != "__file__":
+            elif isinstance(func, ast.Attribute):           # pkg.fn(), pkg.mod.fn(), and mod.fn() after `from pkg import mod`
+                base = func.value
+                while isinstance(base, ast.Attribute):
+                    base = base.value
+                if isinstance(base, ast.Name) and (base.id in module_aliases or base.id in func_aliases):
                     has_call = True
             self.generic_visit(node)
 
         def visit_Attribute(self, node: ast.Attribute) -> None:
-            nonlocal reads_source
+            nonlocal reads_source, blocked
             if node.attr == "__file__":
                 reads_source = True
+            if isinstance(node.value, ast.Name) and (node.value.id, node.attr) in BLOCKED_ATTRS:
+                blocked = True
             self.generic_visit(node)
 
         def visit_Constant(self, node: ast.Constant) -> None:
@@ -159,31 +225,40 @@ def ast_block_reason(source: str, packages: set[str]) -> str | None:
     Scanner().visit(tree)
     if reads_source:
         return "reproducer reads source text"
+    if blocked:
+        return "reproducer uses a blocked module or attribute"
     if not has_import:
         return "reproducer does not import the repository"
     if not has_call:
         return "reproducer does not call the repository"
+    if not _marker_is_conditional(tree):
+        return f"reproducer has no {MARKER} marker in a branch"
     return None
 
 
-def interpret_run(claim: Claim, exit_code: int, calls: list[str], output: str) -> Confirmation:
-    """A claim is confirmed only when the named code ran and the script exited 0."""
+def _function_tail(name: str) -> str:
+    """The bare function in a claim's name: `pkg.mod.Class.fn`, `pkg/mod.py:fn` or `fn()` all give `fn`."""
+
+    return re.split(r"[.:]", name.split("(")[0].strip())[-1]
+
+
+def interpret_run(claim: Claim, exit_code: int, calls: list[str], output: str, *, marker_seen: bool) -> Confirmation:
+    """A claim is confirmed only when a function it names was entered, the marker was printed, and the script exited 0.
+    `marker_seen` comes from the whole of stdout: `output` is only its tail."""
 
     called = {item.split(":")[-1] for item in calls}
-    expected = {name.split(".")[-1] for name in claim.functions if name}
+    expected = {tail for tail in map(_function_tail, claim.functions) if tail}
+    if not expected:
+        return Confirmation(False, "claim names no function", exit_code, output, calls)
     if exit_code != 0:
         return Confirmation(False, "exit status was not 0", exit_code, output, calls)
     if not calls:
         return Confirmation(False, "script did not call repository code", exit_code, output, calls)
-    if expected and called.isdisjoint(expected):
+    if called.isdisjoint(expected):
         return Confirmation(False, "named function was not called", exit_code, output, calls)
-    return Confirmation(
-        True,
-        "reproducer called the repository and exited 0",
-        exit_code,
-        output,
-        calls,
-    )
+    if not marker_seen:
+        return Confirmation(False, f"{MARKER} was not printed", exit_code, output, calls)
+    return Confirmation(True, "a named function ran, the marker was printed, and the script exited 0", exit_code, output, calls)
 
 
 def _run_runner(
@@ -195,7 +270,9 @@ def _run_runner(
     extra_env: dict[str, str] | None = None,
     argv_prefix: list[str] | None = None,
     timeout: int = 60,
-) -> tuple[int, list[str], str]:
+) -> tuple[int, list[str], str, bool]:
+    """Returns the exit code, the traced calls, the output's tail, and whether stdout had the marker."""
+
     work.mkdir(parents=True, exist_ok=True)
     repro_path = work / "repro.py"
     runner_path = work / "trace_runner.py"
@@ -214,10 +291,12 @@ def _run_runner(
         command,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=timeout,
         env=env,
         check=False,
     )
+    marker_seen = MARKER in (completed.stdout or "")
     output = ((completed.stdout or "") + (completed.stderr or ""))[-4000:]
     try:
         calls = json.loads(calls_path.read_text(encoding="utf-8"))
@@ -225,7 +304,7 @@ def _run_runner(
         calls = []
     if not isinstance(calls, list):
         calls = []
-    return completed.returncode, [str(item) for item in calls], output
+    return completed.returncode, [str(item) for item in calls], output, marker_seen
 
 
 def os_path() -> str:
@@ -244,7 +323,7 @@ def confirm_local(claim: Claim, checkout: Path, work: Path, *, python: str | Non
     import sys
 
     try:
-        code, calls, output = _run_runner(
+        code, calls, output, marker_seen = _run_runner(
             checkout,
             claim.reproducer,
             work,
@@ -252,7 +331,7 @@ def confirm_local(claim: Claim, checkout: Path, work: Path, *, python: str | Non
         )
     except subprocess.TimeoutExpired:
         return Confirmation(False, "timed out")
-    return interpret_run(claim, code, calls, output)
+    return interpret_run(claim, code, calls, output, marker_seen=marker_seen)
 
 
 def python_tag_for(image: str) -> str:
@@ -546,7 +625,8 @@ def prepare_wheels(
 ) -> DepsStatus:
     """Download wheels uploaded on or before the commit: the declared dependencies, the third-party packages the
     reproducers import (`imports`), and their own dependencies. Nothing is built from source. A package with no wheel
-    is named in `why` and left out; the reproducers that need it fail on their own, the others still run."""
+    is named in `why` and left out; the reproducers that need it fail on their own, the others still run. So is a wheel
+    that does not match the index's sha256."""
 
     deps = dependency_names(root)
     have = {re.sub(r"[-_.]+", "-", name).lower() for name, _version in deps}
@@ -564,6 +644,7 @@ def prepare_wheels(
     download = download or urllib.request.urlretrieve
     fetch_requires = fetch_requires or fetch_pypi_requires
     downloaded: set[str] = set()
+    corrupt: list[str] = []
 
     def requires(item: dict) -> list[str]:
         """Download the chosen wheel now and read its own Requires-Dist; PyPI's JSON only when it has none."""
@@ -573,19 +654,25 @@ def prepare_wheels(
         if link.startswith("https://"):
             try:
                 download(link, path)
-                downloaded.add(item["name"])
+                expected = (item.get("digests") or {}).get("sha256")
+                if expected and hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                    path.unlink(missing_ok=True)
+                    corrupt.append(item["name"])
+                else:
+                    downloaded.add(item["name"])
             except Exception:
                 pass
         return wheel_requires(path) or fetch_requires(item["name"], str(item.get("version") or ""))
 
     chosen, missing = resolve_wheels(deps, commit_time, python_tag=python_tag, fetch=fetch, requires=requires)
     names = [item["name"] for item in chosen if item["name"] in downloaded]
-    missing += [item["name"] for item in chosen if item["name"] not in downloaded]
+    missing += [item["name"] for item in chosen if item["name"] not in downloaded and item["name"] not in corrupt]
+    bad = f"; checksum mismatch for {', '.join(corrupt[:10])}" if corrupt else ""
     if not names:
-        return DepsStatus(True, "no wheel for any dependency on or before the commit: " + ", ".join(missing[:10]))
+        return DepsStatus(True, "no wheel for any dependency on or before the commit: " + ", ".join(missing[:10]) + bad)
     requirements = work / "requirements.txt"
     requirements.write_text("\n".join(names) + "\n", encoding="utf-8")
-    why = "wheels downloaded" + (f"; none for {', '.join(missing[:10])}" if missing else "")
+    why = "wheels downloaded" + (f"; none for {', '.join(missing[:10])}" if missing else "") + bad
     return DepsStatus(True, why, target)
 
 
@@ -595,8 +682,10 @@ def podman_exec_argv(
     work: Path,
     result: Path,
     deps: Path | None,
+    *,
+    name: str | None = None,
 ) -> list[str]:
-    """Podman invocation: no network, checkout mounted read-only."""
+    """Podman invocation: no network, checkout mounted read-only. `name` lets a timeout find the container."""
 
     # The checkout comes first, so an installed package of the same name never shadows the code under review.
     own = "/src/src:/src" if src_layout(checkout) else "/src"
@@ -605,6 +694,7 @@ def podman_exec_argv(
         "podman",
         "run",
         "--rm",
+        *(["--name", name] if name else []),
         "--network",
         "none",
         *HARDENING,
@@ -639,13 +729,14 @@ def podman_exec_argv(
     return argv
 
 
-def podman_pip_argv(image: str, wheels: Path, deps: Path, requirements: Path) -> list[str]:
+def podman_pip_argv(image: str, wheels: Path, deps: Path, requirements: Path, *, name: str | None = None) -> list[str]:
     """Install already-downloaded wheels inside the container. No index, no builds."""
 
     return [
         "podman",
         "run",
         "--rm",
+        *(["--name", name] if name else []),
         "--network",
         "none",
         *HARDENING,
@@ -673,6 +764,19 @@ def podman_pip_argv(image: str, wheels: Path, deps: Path, requirements: Path) ->
     ]
 
 
+def _container_name() -> str:
+    return f"alien-hunt-{uuid.uuid4().hex[:12]}"
+
+
+def _kill_container(name: str) -> None:
+    """A timeout ends the podman client, not the container: a runaway script would keep its CPU and memory."""
+
+    try:
+        subprocess.run(["podman", "kill", name], capture_output=True, timeout=20, check=False)
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.warning("could not kill container %s: %s", name, exc)
+
+
 def install_wheels(image: str, work: Path, deps: DepsStatus) -> str | None:
     """Install downloaded wheels. Returns an error string, or None on success."""
 
@@ -682,13 +786,19 @@ def install_wheels(image: str, work: Path, deps: DepsStatus) -> str | None:
     requirements = work / "requirements.txt"
     if not shutil.which("podman"):
         return "podman is not available"
-    completed = subprocess.run(
-        podman_pip_argv(image, wheels, deps.target, requirements),
-        capture_output=True,
-        text=True,
-        timeout=180,
-        check=False,
-    )
+    name = _container_name()
+    try:
+        completed = subprocess.run(
+            podman_pip_argv(image, wheels, deps.target, requirements, name=name),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        _kill_container(name)
+        return "wheel install timed out"
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "pip failed").strip().splitlines()
         return f"wheel install failed: {detail[-1][:300]}"
@@ -702,8 +812,12 @@ def confirm_podman(
     *,
     image: str,
     deps: DepsStatus,
+    timeout: int = 60,
 ) -> Confirmation:
-    """Run one reproducer in Podman. Model output is never executed on the host."""
+    """Run one reproducer in Podman. Model output is never executed on the host.
+
+    When the wheels could not be installed the reproducer still runs without them: many need none, and one broken
+    wheel must not void every claim. A refusal then carries the reason."""
 
     packages = set(package_names(checkout))
     blocked = ast_block_reason(claim.reproducer, packages)
@@ -711,8 +825,6 @@ def confirm_podman(
         return Confirmation(False, blocked)
     if not shutil.which("podman"):
         return Confirmation(False, "podman is not available")
-    if not deps.ok:
-        return Confirmation(False, deps.why)
     slot = work / "podman"
     result = slot / "result"
     scripts = slot / "scripts"
@@ -720,17 +832,29 @@ def confirm_podman(
     scripts.mkdir(parents=True, exist_ok=True)
     (scripts / "repro.py").write_text(claim.reproducer, encoding="utf-8")
     (scripts / "trace_runner.py").write_text(_RUNNER, encoding="utf-8")
-    argv = podman_exec_argv(image, checkout, scripts, result, deps.target)
+    note = "" if deps.ok else f"; dependencies unavailable: {deps.why}"
+    name = _container_name()
+    argv = podman_exec_argv(image, checkout, scripts, result, deps.target if deps.ok else None, name=name)
     try:
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=60, check=False)
+        completed = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
-        return Confirmation(False, "timed out")
+        _kill_container(name)
+        return Confirmation(False, "timed out" + note)
+    marker_seen = MARKER in (completed.stdout or "")
     output = ((completed.stdout or "") + (completed.stderr or ""))[-4000:]
     calls_path = result / "calls.json"
+    if completed.returncode in (125, 126, 127) and not calls_path.exists():
+        # podman or the runtime failed, say a resource flag the host's cgroups refuse: the script never ran
+        detail = (completed.stderr or "").strip().splitlines()
+        return Confirmation(False, f"the container did not start: {detail[-1][:300] if detail else completed.returncode}",
+                            completed.returncode, output)
     try:
         calls = json.loads(calls_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         calls = []
     if not isinstance(calls, list):
         calls = []
-    return interpret_run(claim, completed.returncode, [str(item) for item in calls], output)
+    confirmation = interpret_run(claim, completed.returncode, [str(item) for item in calls], output, marker_seen=marker_seen)
+    if not confirmation.confirmed:
+        confirmation.why += note
+    return confirmation

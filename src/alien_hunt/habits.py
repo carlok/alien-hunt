@@ -5,17 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from alien_hunt.agent import PaidModel, run_agent
+from alien_hunt.prompts import CLAIM_RULES
 from alien_hunt.scanners import run_scanners
 from alien_hunt.types import Claim
 
-_SYSTEM = """You are reviewing a Python repository for defects.
+_SYSTEM = f"""You are reviewing a Python repository for defects.
 Use only list_dir, read_file, and search. Do not assume a defect you did not read.
 Submit at most 10 claims through submit_claims.
-Each claim needs text, class, files, functions, and a Python reproducer.
-The reproducer must import the repository and call the function under test.
-It must exit 0 only when that call observed the defect.
-Do not open the repository's .py files from the reproducer.
-Set path_exists to true.
+{CLAIM_RULES}Set path_exists to true.
 """
 
 
@@ -44,38 +41,40 @@ def package_names(root: Path) -> list[str]:
     return names
 
 
-def plain_reviews(
+def plain_pass(
     model: PaidModel,
     root: Path,
     *,
+    index: int,
+    passes: int,
     rounds: int,
-    passes: int = 3,
     max_output: int = 4000,
+    temperature: float | None = None,
 ) -> list[Claim]:
-    """Run the same plain review `passes` times."""
+    """One plain review. The pipeline runs them one at a time, so a pass that fails loses only itself. `temperature`
+    overrides the run's for this review: at 0 the passes tend to be one review made three times, which is a thin habit
+    set."""
 
     names = ", ".join(package_names(root)) or "(no package detected)"
-    claims: list[Claim] = []
-    for index in range(passes):
-        user = (
-            f"STAGE: plain\n"
-            f"Pass {index + 1} of {passes}. Importable packages: {names}.\n"
-            "Look for defects anywhere in this checkout. Submit claims you can support from the files."
-        )
-        result = run_agent(
-            model,
-            root,
-            stage="plain",
-            system=_SYSTEM,
-            user=user,
-            origin="plain",
-            max_rounds=rounds,
-            max_claims=10,
-            token_cap=None,
-            max_output=max_output,
-        )
-        claims.extend(result.claims[:10])
-    return claims
+    user = (
+        f"STAGE: plain\n"
+        f"Pass {index + 1} of {passes}. Importable packages: {names}.\n"
+        "Look for defects anywhere in this checkout. Submit claims you can support from the files."
+    )
+    result = run_agent(
+        model,
+        root,
+        stage="plain",
+        system=_SYSTEM,
+        user=user,
+        origin="plain",
+        max_rounds=rounds,
+        max_claims=10,
+        token_cap=None,
+        max_output=max_output,
+        temperature=temperature,
+    )
+    return result.claims[:10]
 
 
 def habit_texts(claims: list[Claim], root: Path, *, scanners: bool) -> list[str]:
