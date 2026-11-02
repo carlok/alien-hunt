@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from alien_hunt.agent import PaidModel, read_file, resolve_inside
+from alien_hunt.arms import ARMS_FILE, arm_summary, hunt_order, render_table, select_arms, write_label_sheet
 from alien_hunt.atoms import extract_atoms, filter_invariants
 from alien_hunt.budget import Budget, BudgetStop
 from alien_hunt.config import Prices
@@ -59,6 +60,8 @@ class RunState:
     hunted: list[Candidate] = field(default_factory=list)  # the candidates actually hunted (at or above the floor)
     fallback: int = 0  # hunted below the floor, because none reached it
     above_floor: int | None = None
+    arms: dict[str, list[Candidate]] = field(default_factory=dict)  # each rule's picks, with --arms
+    floor: float = 3.0
     skipped: list[str] = field(default_factory=list)  # passes and hunts lost to a model error
 
 
@@ -334,6 +337,7 @@ def _stages(
     min_coherence: float,
     fallback_hunts: int,
     secret: str | None,
+    arms: int,
 ) -> None:
     """The search: atoms, plain reviews, candidates, hunts. Whatever ends it early, `state` holds what was collected."""
 
@@ -367,14 +371,20 @@ def _stages(
     failures.ok()                                       # the endpoint answered all of that
     floor = [item for item in state.ranked_07 if (item.coherence or 0) >= min_coherence]
     state.above_floor = len(floor)
-    if not floor and fallback_hunts:                    # asciitree: nothing reached 3, so nothing was hunted
-        floor = [item for item in state.ranked_07 if item.rated and (item.coherence or 0) >= 2][:fallback_hunts]
-        state.fallback = len(floor)
-    top = floor[:20]
+    state.floor = min_coherence
+    if arms:
+        state.arms = select_arms(state.ranked_07, arms, seed)
+        top = hunt_order(state.arms)
+    else:
+        if not floor and fallback_hunts:                # asciitree: nothing reached 3, so nothing was hunted
+            floor = [item for item in state.ranked_07 if item.rated and (item.coherence or 0) >= 2][:fallback_hunts]
+            state.fallback = len(floor)
+        top = floor[:20]
     state.hunted = top
     for candidate in top:
         if budget.should_stop():
             raise BudgetStop("hunt")
+        spent = budget.spent
         try:
             result = directed_hunt(
                 paid,
@@ -388,6 +398,8 @@ def _stages(
             candidate.hunt_error = str(redact(str(exc), secret))
             failures.bad(exc, f"hunt {candidate.id}")
             continue
+        finally:
+            candidate.hunt_usd = budget.spent - spent
         failures.ok()
         state.claims.extend(result.claims)
         _log_claims(local, result.claims)
@@ -419,6 +431,7 @@ def execute(
     max_output: int = 4000,
     min_coherence: float = 3.0,
     fallback_hunts: int = 3,
+    arms: int = 0,
 ) -> Path:
     """Run the pipeline and return the report path.
 
@@ -452,6 +465,7 @@ def execute(
             min_coherence=min_coherence,
             fallback_hunts=fallback_hunts,
             secret=secret,
+            arms=arms,
         )
     except BudgetStop:
         state.stopped = True
@@ -480,7 +494,7 @@ def execute(
         log.warning("interrupted during confirmation; the report covers what was confirmed so far")
         state.error = state.error or "interrupted during confirmation"
         failure = failure or exc
-    path = _persist(state, out_dir, budget, known, target, commit, secret, run_id, stopped=state.stopped)
+    path = _persist(state, out_dir, budget, known, target, commit, secret, run_id, seed=seed, stopped=state.stopped)
     if failure is not None:
         raise failure
     return path
@@ -534,6 +548,7 @@ def _persist(
     secret: str | None,
     run_id: str,
     *,
+    seed: int,
     stopped: bool,
 ) -> Path:
     confirmed_pairs = [(claim, confirmation) for claim, confirmation in state.confirmations if confirmation.confirmed]
@@ -594,6 +609,12 @@ def _persist(
             for claim, confirmation in state.confirmations
         ],
     )
+    comparison = None
+    if state.arms:
+        summary = arm_summary(state.arms, state.confirmations, known, floor=state.floor)
+        dump_json(out_dir / ARMS_FILE, summary)
+        write_label_sheet(out_dir / "local" / "arms-to-label.jsonl", state.confirmations, seed)
+        comparison = render_table([summary])
     dump_json(out_dir / "usage.json", budget.as_dict())
     rows = public_rows(confirmed, known)
     detail = []
@@ -636,6 +657,7 @@ def _persist(
         above_floor=state.above_floor,
         fallback=state.fallback,
         skipped=state.skipped,
+        comparison=comparison,
     )
     if state.error:
         report += f"\n## Error\n\n{state.error}\n"

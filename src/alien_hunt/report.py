@@ -17,15 +17,14 @@ def _per_usd(count: int, usd: float) -> str:
 SAME_TEXT = 0.8  # cosine of two claim texts' embeddings above which they say the same thing
 
 
-def unique_confirmed(pairs: list[tuple[Claim, Confirmation]], vectors: list | None = None) -> list[Claim]:
-    """One confirmed claim per distinct issue on each side. Two claims are one issue when they share a function and
-    have the same class, or their texts' embeddings are at least SAME_TEXT alike (`vectors`, in the order of the
-    confirmed pairs; without them, class alone). On PyJWT the three reviews confirmed 7 claims that were 3 issues."""
+def merge_claims(claims: list[Claim], vectors: list | None = None) -> list[int]:
+    """A number for each claim, shared by the claims of one issue. Two claims are one issue when they share a function and
+    have the same class, or their texts' embeddings are at least SAME_TEXT alike (`vectors`, in the order of the claims;
+    without them, class alone). A plain review's claim and a hunt's stay apart."""
 
     from alien_hunt.score import cosine
 
-    confirmed = [claim for claim, confirmation in pairs if confirmation.confirmed]
-    parent = list(range(len(confirmed)))
+    parent = list(range(len(claims)))
 
     def find(i: int) -> int:
         while parent[i] != i:
@@ -33,18 +32,25 @@ def unique_confirmed(pairs: list[tuple[Claim, Confirmation]], vectors: list | No
             i = parent[i]
         return i
 
-    for i, a in enumerate(confirmed):
-        for j in range(i + 1, len(confirmed)):
-            b = confirmed[j]
+    for i, a in enumerate(claims):
+        for j in range(i + 1, len(claims)):
+            b = claims[j]
             if (a.origin == "plain") != (b.origin == "plain") or not set(a.functions) & set(b.functions):
                 continue
-            alike = vectors is not None and len(vectors) == len(confirmed) and cosine(vectors[i], vectors[j]) >= SAME_TEXT
+            alike = vectors is not None and len(vectors) == len(claims) and cosine(vectors[i], vectors[j]) >= SAME_TEXT
             if a.class_label.strip().lower() == b.class_label.strip().lower() or alike:
                 parent[find(j)] = find(i)
+    return [find(i) for i in range(len(claims))]
+
+
+def unique_confirmed(pairs: list[tuple[Claim, Confirmation]], vectors: list | None = None) -> list[Claim]:
+    """One confirmed claim per distinct issue on each side (`vectors`, in the order of the confirmed pairs). On PyJWT the
+    three reviews confirmed 7 claims that were 3 issues."""
+
+    confirmed = [claim for claim, confirmation in pairs if confirmation.confirmed]
     seen: set[int] = set()
     chosen: list[Claim] = []
-    for i, claim in enumerate(confirmed):
-        root = find(i)
+    for claim, root in zip(confirmed, merge_claims(confirmed, vectors)):
         if root not in seen:
             seen.add(root)
             chosen.append(claim)
@@ -98,6 +104,7 @@ def render_report(
     above_floor: int | None = None,
     fallback: int = 0,
     skipped: list[str] | None = None,
+    comparison: str | None = None,
 ) -> str:
     """Markdown metrics. Reproducers and narratives are not included."""
 
@@ -115,6 +122,15 @@ def render_report(
     rated = sum(1 for item in pool if item.rated)
     miss = coherence_miss_rate(top)
     miss_text = "n/a" if miss is None else f"{miss:.4f}"
+    hunted_note = (
+        "the floor was off: see Selection comparison"
+        if comparison
+        else f"only those are hunted{f'; none was, so the best {fallback} rated 2 were' if fallback else ''}"
+    )
+    comparison_text = (
+        "## Selection comparison\n\nEach rule picked from the same pool, with no floor. A pick two rules share was hunted once "
+        f"and counts for both, with its full cost.\n\n{comparison}\n\n" if comparison else ""
+    )
     rows = public_rows(claims, known)
     overlap = overlap_functions(claims)
     overlap_text = f"- Functions with a confirmed claim on both sides: {len(overlap)} (named in `local/detail.json`)"
@@ -164,12 +180,12 @@ def render_report(
 Ranked at β = 0.7. The same pool is stored at β = 0.4.
 
 - Coherence ratings parsed: {rated} of {len(pool)} (an unparsed one counts as 1)
-- At or above the coherence floor: {'n/a' if above_floor is None else above_floor} (only those are hunted{f'; none was, so the best {fallback} rated 2 were' if fallback else ''})
+- At or above the coherence floor: {'n/a' if above_floor is None else above_floor} ({hunted_note})
 - Top candidates judged: {len(judged)} of {len(top)} (a hunt that never submitted gives no verdict)
 - Incoherent among them: {incoherent}
 - Miss rate among ratings of 4 or 5: {miss_text}
 
-## Confirmed claims
+{comparison_text}## Confirmed claims
 
 {'' if confirmed_all is None else f'Before merging duplicates: {confirmed_all}.'}
 
