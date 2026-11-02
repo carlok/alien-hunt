@@ -11,7 +11,7 @@ score = (1 - β) · z(coherence) + β · z(unavailability)
 unavailability = 1 - max cosine similarity to the plain-review claims
 ```
 
-Candidates are built from atoms of the library itself (not its tests, docs or examples): a source and a sink or invariant that live in the same file, else the same top-level folder; the model picks up to three of the 62 mechanisms that could join them, and one more is drawn at random, so the pool keeps some unlikely ones. Only candidates rated `min_coherence` (default 3) or more are hunted, in order of that score. Coherence is a 1–5 rating from the configured model, given the code around the source and around the sink or invariant. Unavailability is embedding distance from the texts that three plain reviews (and any local scanners) already produced. The run keeps the top 20 at β = 0.7 and also stores the ranking at β = 0.4.
+Candidates are built from atoms of the library itself (not its tests, docs or examples): a source and a sink or invariant that live in the same file, else the same top-level folder; the model picks up to three of the 62 mechanisms that could join them, and one more is drawn at random, so the pool keeps some unlikely ones. Only candidates rated `min_coherence` (default 3) or more are hunted, in order of that score (`--arms`, below, is the exception). Coherence is a 1–5 rating from the configured model, given the code around the source and around the sink or invariant. Unavailability is embedding distance from the texts that three plain reviews (and any local scanners) already produced. The run keeps the top 20 at β = 0.7 and also stores the ranking at β = 0.4.
 
 ## What is measured
 
@@ -77,6 +77,34 @@ Nine runs on 2026-10-30, all with Claude Sonnet 5.5 for chat and `text-embedding
   - A plain review confirmed that `validate_iss` reported the wrong claim name. Upstream had fixed it independently after the pinned commit.
   - Neither advisory was found. The sinks and mechanisms for that kind of defect were added afterwards. In the last run they reached the candidate pool, but the sampler drew no candidate in the advisories' functions.
 - Other confirmed claims were minor and aren't listed.
+- **joserfc, 1 more run on 2026-11-02, with the current check (1.98 USD).** 9 candidates were hunted, against 1 in the run before it. The plain reviews found the `validate_exp` bug again, and the first version of the current check refused it because its marker sat in a `try` body, which is why that form now counts. Replayed in Podman with no model calls, all 6 of the run's claims confirm. The 2 from hunts, read by hand, aren't worth reporting: a marker in the right place does not make a claim a defect. Neither advisory was hunted.
+
+## Does the score choose anything?
+
+Not so far. In the five runs whose records show what was hunted (the fourth on PyJWT and four on joserfc), the hunted set is exactly the candidates at or above the floor, and the limit of 20 never cut any. So the floor chose, and the unavailability term only set the order. The results above came through the floor. The paper's author [suggested the test](https://github.com/alejandrohdez00/alien-space-of-science/issues/2): the combined score against coherence alone and a random draw, under the same investigation budget.
+
+`--arms N` runs it. It has not been run yet.
+
+```bash
+alien-hunt run https://github.com/authlib/joserfc \
+  --commit 26a10275e88276184f91ae2a6409647bfac7fea5 \
+  --budget 5 \
+  --known cases/joserfc.toml \
+  --arms 10
+```
+
+- The floor is off, and each rule picks N from the same pool: `combined` by the score at β = 0.7, `coherence` by the rating with ties broken at random, `random` a draw. The reviews and the pool are paid once.
+- What the rules share is a number of hunts, not USD. The table shows what each one cost.
+- A pick two rules share is hunted once and counts for both, with its full cost. The rules take turns, but a run cut short by the budget or an error is not a fair comparison, and `alien-hunt arms` says how many were.
+- On the last joserfc run the reviews and the pool cost 1.50 USD and a hunt about 0.05 USD, so `--arms 10` should cost at most about 3 USD, if low-rated candidates cost the same to hunt.
+
+`REPORT.md` gets a table of counts, and `06-arms.json` holds which rule picked what. "Confirmed" alone is a weak outcome, as the run above shows, so `local/arms-to-label.jsonl` lists every hunt's claim, refused ones too, shuffled and without its rule. Label them from that file alone, before reading the report or anything else in the run's folder, which can tell a claim's rule. The labels are a JSON file from claim id to `"real"` or `"not"`. Then add up the runs:
+
+```bash
+alien-hunt arms out/<run-a> out/<run-b> --labels labels.json
+```
+
+The table counts hunts and USD; hunted picks above the floor and on an advisory; claims; confirmed issues, and those whose functions no plain review named; advisories claimed and confirmed; and, with labels, real issues. Issues merge within a rule, not across rules. One random draw on one library says little: use several libraries, or several `--seed`s, which also redraw the pool.
 
 ## Tests
 

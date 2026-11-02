@@ -9,6 +9,7 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
+from alien_hunt.arms import load_labels, load_run, render_totals
 from alien_hunt.budget import Budget
 from alien_hunt.checkout import (
     CheckoutError,
@@ -66,6 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--out", type=Path, default=Path("out"))
     run.add_argument("--known", type=Path, help="TOML allowlist of public advisories")
     run.add_argument("--seed", type=int, default=0)
+    run.add_argument("--arms", type=int, default=0, help="hunt N picks per selection rule, with the floor off (README)")
+    arms = sub.add_parser("arms", help="add up the runs made with --arms (no model calls)")
+    arms.add_argument("runs", nargs="+", type=Path, help="run folders, each with a 06-arms.json")
+    arms.add_argument("--labels", type=Path, help='JSON from the ids in local/arms-to-label.jsonl to "real" or "not"')
     return parser
 
 
@@ -74,10 +79,8 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command != "run":
-        parser.error("unknown command")
     try:
-        return _run(args)
+        return _run(args) if args.command == "run" else _arms(args)
     except (ConfigError, CheckoutError) as exc:
         print(f"alien-hunt: {exc}", file=sys.stderr)
         return 2
@@ -87,6 +90,14 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("alien-hunt: interrupted", file=sys.stderr)
         return 130
+
+
+def _arms(args: argparse.Namespace) -> int:
+    if len({folder.resolve() for folder in args.runs}) != len(args.runs):
+        raise ConfigError("a run is listed twice")
+    runs = [load_run(folder) for folder in args.runs]
+    print(render_totals(runs, load_labels(args.labels) if args.labels else None))
+    return 0
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -101,6 +112,8 @@ def _run(args: argparse.Namespace) -> int:
         raise CheckoutError("pass a GitHub URL or --local")
     if args.budget < 0:
         raise ConfigError("budget must be >= 0")
+    if args.arms < 0:
+        raise ConfigError("--arms must be >= 0")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config = load_config(args.config)
     secret = config.secrets()
@@ -143,6 +156,7 @@ def _run(args: argparse.Namespace) -> int:
         max_output=config.max_output_tokens,
         min_coherence=config.min_coherence,
         fallback_hunts=config.fallback_hunts,
+        arms=args.arms,
     )
     print(report)
     return 0
