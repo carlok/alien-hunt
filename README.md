@@ -11,7 +11,7 @@ score = (1 - β) · z(coherence) + β · z(unavailability)
 unavailability = 1 - max cosine similarity to the plain-review claims
 ```
 
-Candidates are built from atoms of the library itself (not its tests, docs or examples): a source and a sink or invariant that live in the same file, else the same top-level folder; the model picks up to three of the 62 mechanisms that could join them, and one more is drawn at random, so the pool keeps some unlikely ones. Only candidates rated `min_coherence` (default 3) or more are hunted, in order of that score. Coherence is a 1–5 rating from the configured model, given the code around the source and around the sink or invariant. Unavailability is embedding distance from the texts that three plain reviews (and any local scanners) already produced. The run keeps the top 20 at β = 0.7 and also stores the ranking at β = 0.4.
+Candidates are built from atoms of the library itself (not its tests, docs or examples): a source and a sink or invariant that live in the same file, else the same top-level folder; the model picks up to three of the 62 mechanisms that could join them, and one more is drawn at random, so the pool keeps some unlikely ones. Only candidates rated `min_coherence` (default 3) or more are hunted, in order of that score (`--arms`, below, is the exception). Coherence is a 1–5 rating from the configured model, given the code around the source and around the sink or invariant. Unavailability is embedding distance from the texts that three plain reviews (and any local scanners) already produced. The run keeps the top 20 at β = 0.7 and also stores the ranking at β = 0.4.
 
 ## What is measured
 
@@ -94,16 +94,17 @@ alien-hunt run https://github.com/authlib/joserfc \
 ```
 
 - The floor is off, and each rule picks N from the same pool: `combined` by the score at β = 0.7, `coherence` by the rating with ties broken at random, `random` a draw. The reviews and the pool are paid once.
-- A pick two rules share is hunted once and counts for both, with its full cost. The rules take turns, so a budget stop cuts them about evenly, and the table shows how many hunts each one got.
-- On the last joserfc run the reviews and the pool cost 1.50 USD and a hunt about 0.05 USD, so `--arms 10` should cost about 3 USD, if low-rated candidates cost the same to hunt.
+- What the rules share is a number of hunts, not USD. The table shows what each one cost.
+- A pick two rules share is hunted once and counts for both, with its full cost. The rules take turns, but a run cut short by the budget or an error is not a fair comparison, and `alien-hunt arms` says how many were.
+- On the last joserfc run the reviews and the pool cost 1.50 USD and a hunt about 0.05 USD, so `--arms 10` should cost at most about 3 USD, if low-rated candidates cost the same to hunt.
 
-`REPORT.md` gets a table of counts, and `06-arms.json` holds which rule picked what. "Confirmed" alone is a weak outcome, as the run above shows, so `local/arms-to-label.jsonl` lists every hunt's claim, refused ones too, shuffled and without its rule. Label them before opening `06-arms.json`, in a JSON file from claim id to `"real"` or `"not"`, then add up the runs:
+`REPORT.md` gets a table of counts, and `06-arms.json` holds which rule picked what. "Confirmed" alone is a weak outcome, as the run above shows, so `local/arms-to-label.jsonl` lists every hunt's claim, refused ones too, shuffled and without its rule. Label them from that file alone, before reading the report or anything else in the run's folder, which can tell a claim's rule. The labels are a JSON file from claim id to `"real"` or `"not"`. Then add up the runs:
 
 ```bash
 alien-hunt arms out/<run-a> out/<run-b> --labels labels.json
 ```
 
-The table counts hunts and USD; picks above the floor and picks on an advisory; claims; confirmed issues, and those whose functions no plain review named; advisories claimed and confirmed; and, with labels, real issues. One random draw on one library says little: use several libraries, or several `--seed`s, which also redraw the pool.
+The table counts hunts and USD; hunted picks above the floor and on an advisory; claims; confirmed issues, and those whose functions no plain review named; advisories claimed and confirmed; and, with labels, real issues. Issues merge within a rule, not across rules. One random draw on one library says little: use several libraries, or several `--seed`s, which also redraw the pool.
 
 ## Tests
 

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from alien_hunt.config import ConfigError
 from alien_hunt.redact import file_hit, matching_advisory, symbol_hit
-from alien_hunt.report import merge_claims
+from alien_hunt.report import merge_claims, unique_confirmed
 from alien_hunt.types import Candidate, Claim, Confirmation, KnownAdvisory
 
 ARMS = ("combined", "coherence", "random")
@@ -37,13 +37,16 @@ def select_arms(ranked: list[Candidate], hunts: int, seed: int) -> dict[str, lis
 
 
 def hunt_order(arms: dict[str, list[Candidate]]) -> list[Candidate]:
-    """Each pick once, the rules taking turns, so a budget stop cuts them about evenly."""
+    """Each pick once, the rules taking turns, and a different rule first each time round, so that a budget stop favours
+    none of them for long. It still leaves them up to one hunt apart, and a run cut short is flagged."""
 
+    names = list(arms)
     order: dict[str, Candidate] = {}
     for turn in range(max((len(picks) for picks in arms.values()), default=0)):
-        for picks in arms.values():
-            if turn < len(picks):
-                order.setdefault(picks[turn].id, picks[turn])
+        first = turn % len(names)
+        for name in [*names[first:], *names[:first]]:
+            if turn < len(arms[name]):
+                order.setdefault(arms[name][turn].id, arms[name][turn])
     return list(order.values())
 
 
@@ -60,42 +63,79 @@ def _touches(candidate: Candidate, known: list[KnownAdvisory]) -> bool:
     return any(symbol_hit(functions, symbol) or file_hit(files, symbol) for advisory in known for symbol in advisory.symbols)
 
 
+def _beyond_reviews(claim: Claim, reviewed: list[str]) -> bool:
+    """No plain review named a function of this claim, whether or not that review's own claim was confirmed: what it
+    reported is what was available. Names differ in form (`validate_exp`, `Registry.validate_exp`), so a whole part of
+    one name matching the other counts as the same function."""
+
+    if not claim.functions:
+        return False
+    return not any(symbol_hit(claim.functions, name) or symbol_hit(reviewed, function)
+                   for name in reviewed for function in claim.functions)
+
+
+def _rule(
+    picks: list[Candidate],
+    hunts: list[tuple[Claim, Confirmation]],
+    reviewed: list[str],
+    known: list[KnownAdvisory],
+    floor: float,
+) -> dict:
+    """One rule's counts. Its claims merge among themselves only: merged across rules, a claim of another rule could join
+    two issues of this one. Confirmed issues merge among the confirmed only, as the report does, so that a refused claim
+    can't join two of them."""
+
+    ran = [item for item in picks if item.hunt_usd is not None and item.hunt_error is None]
+    ids = {item.id for item in picks}
+    mine = [(claim, confirmation) for claim, confirmation in hunts if claim.candidate_id in ids]
+    claims = [claim for claim, _ in mine]
+    issues: dict[int, list[Claim]] = {}
+    for claim, issue in zip(claims, merge_claims(claims)):
+        issues.setdefault(issue, []).append(claim)
+    confirmed = [claim for claim, confirmation in mine if confirmation.confirmed]
+    distinct = unique_confirmed(mine)
+
+    def advisories(among: list[Claim]) -> list[str]:
+        return sorted({advisory.id for claim in among if (advisory := matching_advisory(claim, known))})
+
+    return {
+        "picks": [item.id for item in picks],
+        "hunts": len(ran),
+        "usd": sum(item.hunt_usd or 0.0 for item in picks),
+        "above_floor": sum(1 for item in ran if (item.coherence or 0.0) >= floor),
+        "on_advisory": sum(1 for item in ran if _touches(item, known)),
+        "claims": len(claims),
+        "confirmed": len(distinct),
+        "beyond": sum(1 for claim in distinct if _beyond_reviews(claim, reviewed)),
+        "advisories_claimed": advisories(claims),
+        "advisories_confirmed": advisories(confirmed),
+        "issues": [
+            {"claims": [claim_id(claim) for claim in members], "beyond": any(_beyond_reviews(claim, reviewed) for claim in members)}
+            for members in issues.values()
+        ],
+    }
+
+
 def arm_summary(
     arms: dict[str, list[Candidate]],
     confirmations: list[tuple[Claim, Confirmation]],
     known: list[KnownAdvisory],
     *,
     floor: float,
+    seed: int = 0,
+    cut_short: bool = False,
 ) -> dict:
     """What `06-arms.json` holds: ids and counts, no claim text. A pick two rules share was hunted once and counts for
-    both, with its full cost, as if each rule had run alone. A hunt lost to a model error or never reached is no hunt.
-    Beyond the reviews: no plain review named the function, whether or not that review's claim was confirmed."""
+    both, with its full cost, as if each rule had run alone. A hunt lost to a model error, cut by the budget or never
+    reached is no hunt, though what it spent still counts."""
 
     hunts = [(claim, confirmation) for claim, confirmation in confirmations if claim.origin != "plain"]
-    reviewed = {name for claim, _ in confirmations if claim.origin == "plain" for name in claim.functions}
-    issues = merge_claims([claim for claim, _ in hunts])
+    reviewed = sorted({name for claim, _ in confirmations if claim.origin == "plain" for name in claim.functions})
     return {
-        "arms": {
-            name: {
-                "picks": [item.id for item in picks],
-                "hunts": sum(1 for item in picks if item.hunt_usd is not None and item.hunt_error is None),
-                "usd": sum(item.hunt_usd or 0.0 for item in picks),
-                "above_floor": sum(1 for item in picks if (item.coherence or 0.0) >= floor),
-                "on_advisory": sum(1 for item in picks if _touches(item, known)),
-            }
-            for name, picks in arms.items()
-        },
-        "claims": [
-            {
-                "id": claim_id(claim),
-                "candidate": claim.candidate_id,
-                "issue": issue,
-                "confirmed": confirmation.confirmed,
-                "beyond_reviews": not reviewed & set(claim.functions),
-                "advisory": advisory.id if (advisory := matching_advisory(claim, known)) else None,
-            }
-            for (claim, confirmation), issue in zip(hunts, issues)
-        ],
+        "seed": seed,
+        "floor": floor,
+        "cut_short": cut_short,
+        "arms": {name: _rule(picks, hunts, reviewed, known, floor) for name, picks in arms.items()},
     }
 
 
@@ -125,8 +165,8 @@ def write_label_sheet(path: Path, confirmations: list[tuple[Claim, Confirmation]
 
 
 def arm_totals(runs: list[dict], labels: dict[str, str] | None = None) -> dict[str, dict]:
-    """Add up runs, rule by rule. Issues count once per run. An issue is real when a claim of it is labelled real, and
-    unlabelled when none of its claims has a label."""
+    """Add up runs, rule by rule. An issue is real when a claim of it is labelled real, and unlabelled when none of its
+    claims has a label. Advisories count once per run."""
 
     labels = labels or {}
     fields = ("hunts", "usd", "above_floor", "on_advisory", "claims", "confirmed", "beyond", "advisories_claimed",
@@ -135,25 +175,16 @@ def arm_totals(runs: list[dict], labels: dict[str, str] | None = None) -> dict[s
     for run in runs:
         for name, row in totals.items():
             arm = run["arms"][name]
-            picked = set(arm["picks"])
-            claims = [claim for claim in run["claims"] if claim["candidate"] in picked]
-            confirmed = [claim for claim in claims if claim["confirmed"]]
-            for field in ("hunts", "usd", "above_floor", "on_advisory"):
+            for field in ("hunts", "usd", "above_floor", "on_advisory", "claims", "confirmed", "beyond"):
                 row[field] += arm[field]
-            row["claims"] += len(claims)
-            row["confirmed"] += len({claim["issue"] for claim in confirmed})
-            row["beyond"] += len({claim["issue"] for claim in confirmed if claim["beyond_reviews"]})
-            row["advisories_claimed"] += len({claim["advisory"] for claim in claims if claim["advisory"]})
-            row["advisories_confirmed"] += len({claim["advisory"] for claim in confirmed if claim["advisory"]})
-            issues: dict[int, list[dict]] = {}
-            for claim in claims:
-                issues.setdefault(claim["issue"], []).append(claim)
-            for members in issues.values():
-                said = [labels.get(claim["id"]) for claim in members]
+            row["advisories_claimed"] += len(arm["advisories_claimed"])
+            row["advisories_confirmed"] += len(arm["advisories_confirmed"])
+            for issue in arm["issues"]:
+                said = [labels.get(identifier) for identifier in issue["claims"]]
                 row["unlabelled"] += not any(said)
                 if "real" in said:
                     row["real"] += 1
-                    row["real_beyond"] += any(claim["beyond_reviews"] for claim in members)
+                    row["real_beyond"] += issue["beyond"]
     return totals
 
 
@@ -175,9 +206,16 @@ def render_table(runs: list[dict], labels: dict[str, str] | None = None) -> str:
 
 
 def render_totals(runs: list[dict], labels: dict[str, str] | None = None) -> str:
-    lines = [f"Runs: {len(runs)}", "", render_table(runs, labels)]
+    cut = sum(1 for run in runs if run["cut_short"])
+    lines = [f"Runs: {len(runs)} (cut short by the budget or an error: {cut})", "", render_table(runs, labels)]
     if labels is not None:
-        ids = {claim["id"] for run in runs for claim in run["claims"]}
+        ids = {
+            identifier
+            for run in runs
+            for arm in run["arms"].values()
+            for issue in arm["issues"]
+            for identifier in issue["claims"]
+        }
         lines += ["", f"Labels that match no claim: {sum(1 for identifier in labels if identifier not in ids)}"]
     return "\n".join(lines)
 
@@ -185,11 +223,14 @@ def render_totals(runs: list[dict], labels: dict[str, str] | None = None) -> str
 def load_run(folder: Path) -> dict:
     path = folder / ARMS_FILE
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        run = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ConfigError(f"no {ARMS_FILE} in {folder}: that run did not use --arms") from exc
     except (OSError, ValueError) as exc:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
+    if not (isinstance(run, dict) and isinstance(run.get("arms"), dict) and set(run["arms"]) == set(ARMS)):
+        raise ConfigError(f"{path} is not what --arms writes")
+    return run
 
 
 def load_labels(path: Path) -> dict[str, str]:

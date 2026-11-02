@@ -15,10 +15,16 @@ from alien_hunt.budget import Budget
 from alien_hunt.cli import main
 from alien_hunt.config import Prices
 from alien_hunt.pipeline import execute
-from alien_hunt.types import Atom, Candidate, Claim, Confirmation, KnownAdvisory
+from alien_hunt.types import Atom, Candidate, ChatResponse, Claim, Confirmation, KnownAdvisory, ToolCall
 from test_pipeline import FIXTURE, ScriptedModel
 
 ADVISORY = KnownAdvisory(id="GHSA-x", class_label="denial of service", symbols=["extract_compact"], classes=["dos"])
+
+
+def _hunted(*candidates: Candidate) -> list[Candidate]:
+    for candidate in candidates:
+        candidate.hunt_usd = 0.1
+    return list(candidates)
 
 
 def _candidate(name: str, coherence: float, score: float, function: str | None = None) -> Candidate:
@@ -97,7 +103,40 @@ def test_a_pool_smaller_than_the_ask_is_taken_whole():
 def test_rules_take_turns_and_a_shared_pick_is_hunted_once():
     a, b, c, d = (_candidate(name, 1.0, 1.0) for name in "abcd")
     arms = {"combined": [a, b], "coherence": [a, c], "random": [d, b]}
-    assert [item.id for item in hunt_order(arms)] == ["a", "d", "b", "c"]
+    assert [item.id for item in hunt_order(arms)] == ["a", "d", "c", "b"]
+
+
+def test_no_rule_is_always_first_so_a_stop_leaves_them_within_one_hunt():
+    pools = {name: [_candidate(f"{name}{index}", 1.0, 1.0) for index in range(6)] for name in ARMS}
+    order = hunt_order(pools)
+    assert [item.id[:-1] for item in order[:6]] == ["combined", "coherence", "random", "coherence", "random", "combined"]
+    for stop in range(len(order) + 1):
+        reached = [sum(1 for item in order[:stop] if item.id.startswith(name)) for name in ARMS]
+        assert max(reached) - min(reached) <= 1
+
+
+def test_claims_merge_within_a_rule_and_not_across_rules():
+    """A claim of the random rule naming both functions would otherwise join the combined rule's two issues into one."""
+
+    a, b = _hunted(_candidate("a", 1.0, 1.0), _candidate("b", 1.0, 1.0))
+    pairs = [
+        (_claim("a", ["pkg.f"], klass="x", text="a1"), YES),
+        (_claim("a", ["pkg.g"], klass="x", text="a2"), YES),
+        (_claim("b", ["pkg.f", "pkg.g"], klass="x", text="b1"), YES),
+    ]
+    run = _run({"combined": [a], "coherence": [], "random": [b]}, pairs)
+    assert (arm_totals([run])["combined"]["confirmed"], arm_totals([run])["random"]["confirmed"]) == (2, 1)
+    assert len(run["arms"]["combined"]["issues"]) == 2
+
+
+def test_a_refused_claim_does_not_join_two_confirmed_issues():
+    pick = _candidate("c", 1.0, 1.0)
+    pairs = [
+        (_claim("c", ["pkg.f"], text="one"), YES),
+        (_claim("c", ["pkg.g"], text="two"), YES),
+        (_claim("c", ["pkg.f", "pkg.g"], text="bridge"), NO),
+    ]
+    assert arm_totals([_run({"combined": [pick], "coherence": [], "random": []}, pairs)])["combined"]["confirmed"] == 2
 
 
 def test_a_shared_pick_counts_for_each_rule_that_took_it():
@@ -131,6 +170,29 @@ def test_two_claims_on_one_issue_count_once_and_a_refused_one_not_at_all():
     assert (totals["claims"], totals["confirmed"]) == (3, 1)
 
 
+@pytest.mark.parametrize(
+    "reviewed, hunted, beyond",
+    [
+        ("pkg.mod.Reg.check", "pkg.mod.Reg.check", False),
+        ("Reg.check", "pkg.mod.Reg.check", False),
+        ("pkg.mod.Reg.check", "check", False),
+        ("pkg.mod.Reg.check", "pkg.mod.Reg.other", True),
+        ("pkg.mod.check_all", "pkg.mod.check", True),
+    ],
+)
+def test_a_function_is_the_same_whatever_form_its_name_takes(reviewed: str, hunted: str, beyond: bool):
+    pick = _candidate("c", 1.0, 1.0)
+    pairs = [(_claim(None, [reviewed], text="review", origin="plain"), NO), (_claim("c", [hunted], text="hunt"), YES)]
+    assert arm_totals([_run({"combined": [pick], "coherence": [], "random": []}, pairs)])["combined"]["beyond"] == int(beyond)
+
+
+def test_a_claim_with_no_function_is_not_beyond_the_reviews():
+    pick = _candidate("c", 1.0, 1.0)
+    run = _run({"combined": [pick], "coherence": [], "random": []}, [(_claim("c", [], text="vague"), YES)])
+    assert run["arms"]["combined"]["beyond"] == 0
+    assert run["arms"]["combined"]["issues"][0]["beyond"] is False
+
+
 def test_beyond_the_reviews_means_no_review_named_the_function():
     """Whether or not the review's own claim was confirmed: what it reported is what was available."""
 
@@ -145,8 +207,7 @@ def test_beyond_the_reviews_means_no_review_named_the_function():
 
 
 def test_advisories_are_counted_by_reach_by_claim_and_by_confirmation():
-    near = _candidate("near", 1.0, 1.0, function="extract_compact")
-    far = _candidate("far", 1.0, 1.0, function="elsewhere")
+    near, far = _hunted(_candidate("near", 1.0, 1.0, function="extract_compact"), _candidate("far", 1.0, 1.0, function="elsewhere"))
     pairs = [(_claim("near", ["extract_compact"], klass="dos", text="a"), NO)]
     arms = {"combined": [near], "coherence": [far], "random": []}
     totals = arm_totals([_run(arms, pairs, [ADVISORY])])
@@ -154,6 +215,12 @@ def test_advisories_are_counted_by_reach_by_claim_and_by_confirmation():
     assert (totals["coherence"]["on_advisory"], totals["coherence"]["advisories_claimed"]) == (0, 0)
     confirmed = arm_totals([_run(arms, [(pairs[0][0], YES)], [ADVISORY])])
     assert confirmed["combined"]["advisories_confirmed"] == 1
+
+
+def test_reach_counts_what_was_hunted_not_what_was_picked():
+    never = _candidate("never", 5.0, 1.0, function="extract_compact")
+    totals = arm_totals([_run({"combined": [never], "coherence": [], "random": []}, [], [ADVISORY])])["combined"]
+    assert (totals["hunts"], totals["above_floor"], totals["on_advisory"]) == (0, 0, 0)
 
 
 def test_labels_decide_what_is_real_and_an_issue_counts_once():
@@ -209,8 +276,14 @@ def test_a_run_hunts_each_pick_once_and_records_the_rules(tmp_path: Path):
     assert sum(1 for prompt in model.prompts if "STAGE: hunt" in prompt) == len(hunted)
     assert {item["id"] for item in json.loads((tmp_path / "04-hunts.json").read_text(encoding="utf-8"))} == hunted
     assert "## Selection comparison" in text and "the floor was off" in text
-    assert "allocate" not in text and "allocate" not in json.dumps(run)
-    assert (tmp_path / "local" / "arms-to-label.jsonl").is_file()
+    assert "allocate" not in text
+    assert run["cut_short"] is False and run["floor"] == 3.0
+    best = run["arms"]["coherence"]
+    assert best["hunts"] == 2 and best["confirmed"] >= 1 and best["beyond"] == best["confirmed"]
+    ids = {identifier for name in ARMS for issue in run["arms"][name]["issues"] for identifier in issue["claims"]}
+    sheet = [json.loads(line) for line in (tmp_path / "local" / "arms-to-label.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert ids and {row["id"] for row in sheet} == ids
+    assert all(row["reproducer"] and "load_config" not in row["text"] for row in sheet)
 
 
 def test_a_usual_run_keeps_the_floor_and_writes_no_comparison(tmp_path: Path):
@@ -218,6 +291,8 @@ def test_a_usual_run_keeps_the_floor_and_writes_no_comparison(tmp_path: Path):
     assert "## Selection comparison" not in text and "only those are hunted" in text
     assert not (tmp_path / "06-arms.json").exists()
     assert not (tmp_path / "local" / "arms-to-label.jsonl").exists()
+    hunts = json.loads((tmp_path / "04-hunts.json").read_text(encoding="utf-8"))
+    assert hunts and all(item["coherence"] >= 3 for item in hunts)
 
 
 class _StopsAfterOneHunt(ScriptedModel):
@@ -236,26 +311,68 @@ def test_a_budget_stop_shows_how_far_each_rule_got(tmp_path: Path):
     budget = Budget(limit_usd=5)
     text = _execute(tmp_path, _StopsAfterOneHunt(budget), budget).read_text(encoding="utf-8")
     run = json.loads((tmp_path / "06-arms.json").read_text(encoding="utf-8"))
-    assert "Stopped early: yes" in text
+    assert "Stopped early: yes" in text and run["cut_short"] is True
     assert max(run["arms"][name]["hunts"] for name in ARMS) == 1
     assert all(len(run["arms"][name]["picks"]) == 2 for name in ARMS)
 
 
+class _CutMidHunt(ScriptedModel):
+    """The first hunt asks for a tool, and the stop line is crossed before it can go on."""
+
+    def __init__(self, budget: Budget) -> None:
+        super().__init__()
+        self.budget = budget
+
+    def chat(self, *, messages, tools, max_tokens):
+        response = super().chat(messages=messages, tools=tools, max_tokens=max_tokens)
+        if "STAGE: hunt" in self.prompts[-1]:
+            self.budget.limit_usd = 0
+            return ChatResponse("", [ToolCall(id="call-1", name="list_dir", arguments={"path": "."})], 100, 50)
+        return response
+
+
+def test_a_hunt_the_budget_cuts_is_no_hunt_but_its_cost_stays(tmp_path: Path):
+    budget = Budget(limit_usd=5)
+    _execute(tmp_path, _CutMidHunt(budget), budget)
+    run = json.loads((tmp_path / "06-arms.json").read_text(encoding="utf-8"))
+    assert run["cut_short"] is True
+    assert all(run["arms"][name]["hunts"] == 0 for name in ARMS)
+    assert max(run["arms"][name]["usd"] for name in ARMS) > 0
+    errors = [item["error"] for item in json.loads((tmp_path / "04-hunts.json").read_text(encoding="utf-8"))]
+    assert "cut by the budget" in errors
+
+
 def test_the_command_adds_up_runs_with_labels(tmp_path: Path, capsys):
-    pick = _candidate("c", 1.0, 1.0)
-    pick.hunt_usd = 0.5
-    claim = _claim("c", ["pkg.f"], text="one")
-    run = _run({"combined": [pick], "coherence": [], "random": []}, [(claim, YES)])
-    for name in ("a", "b"):
+    claims = [_claim("c", ["pkg.f"], text="found in the first run"), _claim("c", ["pkg.f"], text="found in the second")]
+    labels = tmp_path / "labels.json"
+    labels.write_text(json.dumps({claim_id(claims[0]): "real", "typo": "real"}), encoding="utf-8")
+    for name, claim in zip("ab", claims):
+        pick = _candidate("c", 1.0, 1.0)
+        pick.hunt_usd = 0.5
+        run = arm_summary({"combined": [pick], "coherence": [], "random": []}, [(claim, YES)], [], floor=3.0, cut_short=name == "b")
         (tmp_path / name).mkdir()
         (tmp_path / name / "06-arms.json").write_text(json.dumps(run), encoding="utf-8")
-    labels = tmp_path / "labels.json"
-    labels.write_text(json.dumps({claim_id(claim): "real", "typo": "real"}), encoding="utf-8")
     assert main(["arms", str(tmp_path / "a"), str(tmp_path / "b"), "--labels", str(labels)]) == 0
     out = capsys.readouterr().out
+    head = next(line for line in out.splitlines() if line.startswith("| Rule"))
     row = next(line for line in out.splitlines() if line.startswith("| combined"))
-    assert [cell.strip() for cell in row.strip("|").split("|")][1:3] == ["2", "1.00"]
-    assert "Runs: 2" in out and "Labels that match no claim: 1" in out
+    cells = dict(zip((cell.strip() for cell in head.strip("|").split("|")), (cell.strip() for cell in row.strip("|").split("|"))))
+    assert (cells["Hunts"], cells["USD"], cells["Confirmed issues"]) == ("2", "1.00", "2")
+    assert (cells["Real"], cells["Real beyond the reviews"], cells["Unlabelled"]) == ("1", "1", "1")
+    assert "Runs: 2 (cut short by the budget or an error: 1)" in out and "Labels that match no claim: 1" in out
+
+
+def test_the_command_refuses_the_same_run_twice(tmp_path: Path, capsys):
+    (tmp_path / "06-arms.json").write_text(json.dumps(_run({name: [] for name in ARMS}, [])), encoding="utf-8")
+    assert main(["arms", str(tmp_path), str(tmp_path / ".")]) == 2
+    assert "twice" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("body", ["[]", "{}", '{"arms": {"combined": {}}}', "not json"])
+def test_the_command_refuses_a_file_it_did_not_write(tmp_path: Path, capsys, body: str):
+    (tmp_path / "06-arms.json").write_text(body, encoding="utf-8")
+    assert main(["arms", str(tmp_path)]) == 2
+    assert "06-arms.json" in capsys.readouterr().err
 
 
 def test_the_command_refuses_a_run_with_no_comparison(tmp_path: Path, capsys):

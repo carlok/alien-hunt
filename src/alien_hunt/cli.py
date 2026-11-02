@@ -93,6 +93,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _arms(args: argparse.Namespace) -> int:
+    if len({folder.resolve() for folder in args.runs}) != len(args.runs):
+        raise ConfigError("a run is listed twice")
     runs = [load_run(folder) for folder in args.runs]
     print(render_totals(runs, load_labels(args.labels) if args.labels else None))
     return 0

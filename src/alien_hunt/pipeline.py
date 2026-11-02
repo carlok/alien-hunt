@@ -398,6 +398,9 @@ def _stages(
             candidate.hunt_error = str(redact(str(exc), secret))
             failures.bad(exc, f"hunt {candidate.id}")
             continue
+        except BudgetStop:
+            candidate.hunt_error = "cut by the budget"
+            raise
         finally:
             candidate.hunt_usd = budget.spent - spent
         failures.ok()
@@ -611,7 +614,8 @@ def _persist(
     )
     comparison = None
     if state.arms:
-        summary = arm_summary(state.arms, state.confirmations, known, floor=state.floor)
+        cut_short = bool(stopped or state.stopped or state.error)
+        summary = arm_summary(state.arms, state.confirmations, known, floor=state.floor, seed=seed, cut_short=cut_short)
         dump_json(out_dir / ARMS_FILE, summary)
         write_label_sheet(out_dir / "local" / "arms-to-label.jsonl", state.confirmations, seed)
         comparison = render_table([summary])

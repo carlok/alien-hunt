@@ -95,7 +95,7 @@ class Candidate:
     incoherent: bool | None = None
     path_exists: bool | None = None
     rated: bool = False  # the coherence rating was parsed, not defaulted
-    hunt_error: str | None = None  # the hunt was skipped after this model error
+    hunt_error: str | None = None  # the hunt was lost to this model error, or cut by the budget
     hunt_usd: float | None = None  # what its hunt cost; None when it never ran
 
     def triple_text(self) -> str:
