@@ -33,6 +33,7 @@ def _claim(functions: list[str], reproducer: str = GOOD) -> Claim:
         'if not allocate(0):\n    pass\nelse:\n    print("DEFECT-OBSERVED")\n',
         'try:\n    allocate(-1)\nexcept ValueError:\n    print("DEFECT-OBSERVED")\n',
         'try:\n    allocate(-1)\nexcept ValueError:\n    raise SystemExit(1)\nelse:\n    print("DEFECT-OBSERVED")\n',
+        'try:\n    allocate(-1)\n    print("DEFECT-OBSERVED")\nexcept ValueError:\n    raise SystemExit(1)\n',
         'got = allocate(0)\nif got:\n    print(f"DEFECT-OBSERVED {got}")\n',
         'def main():\n    if allocate(0):\n        print("DEFECT-OBSERVED")\nif __name__ == "__main__":\n    main()\n',
     ],
@@ -51,6 +52,9 @@ def test_a_marker_in_a_branch_passes(body: str):
         'allocate(0)\nif True:\n    print("DEFECT-OBSERVED")\n',
         'import sys\nif allocate(0):\n    sys.stdout.write("DEFECT-OBSERVED")\n',
         'MARK = "DEFECT-OBSERVED"\nif allocate(0):\n    print(MARK)\n',
+        'allocate(0)\ntry:\n    print("DEFECT-OBSERVED")\nexcept ValueError:\n    pass\n',
+        'try:\n    print("DEFECT-OBSERVED")\n    allocate(0)\nexcept ValueError:\n    pass\n',
+        'try:\n    allocate(0)\n    print("DEFECT-OBSERVED")\nfinally:\n    pass\n',
     ],
 )
 def test_a_marker_that_no_branch_decides_is_refused(body: str):
@@ -79,6 +83,14 @@ def test_a_repository_of_that_name_is_its_own_module():
 )
 def test_a_call_through_a_module_counts_as_a_call(script: str):
     assert ast_block_reason(script + '    print("DEFECT-OBSERVED")\n', {"pkg"}) is None
+
+
+def test_a_call_that_raises_keeps_the_marker_in_the_try_from_printing(tmp_path: Path):
+    template = 'from samplelib import allocate\ntry:\n    allocate({arg})\n    print("DEFECT-OBSERVED")\nexcept {error}:\n    raise SystemExit(1)\n'
+    passed = confirm_local(_claim(["samplelib.allocate"], template.format(arg=0, error="ValueError")), FIXTURE, tmp_path / "a")
+    raised = confirm_local(_claim(["samplelib.allocate"], template.format(arg='"x"', error="TypeError")), FIXTURE, tmp_path / "b")
+    assert passed.confirmed
+    assert (raised.confirmed, raised.exit_code) == (False, 1)
 
 
 def test_a_branch_not_taken_is_refused_though_the_function_ran(tmp_path: Path):

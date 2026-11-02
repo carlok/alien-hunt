@@ -127,7 +127,8 @@ def _decides_nothing(test: ast.expr) -> bool:
 
 def _marker_is_conditional(tree: ast.AST) -> bool:
     """True when a print call that names the marker sits in an `if` body or `else`, an `except`, or a `try`'s `else`
-    (the call raised nothing, which is the defect when it should have refused the input)."""
+    (the call raised nothing, which is the defect when it should have refused the input). A print after a call in the
+    body of a `try` with a handler says the same as that `else`: the call raising skips it."""
 
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     for node in ast.walk(tree):
@@ -148,6 +149,10 @@ def _marker_is_conditional(tree: ast.AST) -> bool:
                 return True
             if isinstance(parent, (ast.Try, ast.TryStar)) and child in parent.orelse:
                 return True
+            if isinstance(parent, (ast.Try, ast.TryStar)) and parent.handlers and child in parent.body:
+                earlier = parent.body[: parent.body.index(child)]
+                if any(isinstance(part, ast.Call) for statement in earlier for part in ast.walk(statement)):
+                    return True
             child, parent = parent, parents.get(parent)
     return False
 
