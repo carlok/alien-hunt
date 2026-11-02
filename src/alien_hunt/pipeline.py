@@ -1,4 +1,4 @@
-"""Wire the stages. Each stage writes JSON under the run directory."""
+"""Wire the stages. Claims are logged as they arrive; each stage writes JSON under the run directory at the end."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from alien_hunt.agent import PaidModel
+from alien_hunt.agent import PaidModel, read_file, resolve_inside
 from alien_hunt.atoms import extract_atoms, filter_invariants
 from alien_hunt.budget import Budget, BudgetStop
 from alien_hunt.config import Prices
@@ -22,17 +22,21 @@ from alien_hunt.confirm import (
     python_tag_for,
     reproducer_imports,
 )
-from alien_hunt.habits import habit_texts, package_names, plain_reviews
+from alien_hunt.habits import habit_texts, package_names, plain_pass
 from alien_hunt.hunt import directed_hunt
 from alien_hunt.llm import LLMError
 from alien_hunt.redact import redact
 from alien_hunt.report import overlap_functions, public_rows, render_report, unique_confirmed
 from alien_hunt.score import apply_scores, colocated_pairs, unavailability
-from alien_hunt.types import Candidate, Claim, Confirmation, KnownAdvisory
+from alien_hunt.types import Atom, Candidate, Claim, Confirmation, KnownAdvisory
 
 log = logging.getLogger("alien_hunt")
 
 _PLAIN_SYSTEM_NOTE = "STAGE: invariants"
+_PLAIN_PASSES = 3
+_MAX_CONSECUTIVE_FAILURES = 3
+_EXCERPT_LINES = 20
+_EXCERPT_CHARS = 1500
 
 
 @dataclass
@@ -55,6 +59,7 @@ class RunState:
     hunted: list[Candidate] = field(default_factory=list)  # the candidates actually hunted (at or above the floor)
     fallback: int = 0  # hunted below the floor, because none reached it
     above_floor: int | None = None
+    skipped: list[str] = field(default_factory=list)  # passes and hunts lost to a model error
 
 
 def dump_json(path: Path, payload: object) -> None:
@@ -90,11 +95,36 @@ def _cap_coherence(candidate: Candidate, root: Path) -> None:
         file_part, _, func = entry.partition(":")
         if func:
             candidate.named_functions.append(func)
-        if file_part and not (root / file_part).is_file():
+        if not file_part:
+            continue
+        try:
+            files_ok = files_ok and resolve_inside(root, file_part).is_file()
+        except Exception:                           # a path from the model: outside the checkout, or not a path at all
             files_ok = False
     if not candidate.path or not files_ok:
         score = min(score, 2.0)
     candidate.coherence = score
+
+
+def _excerpt(root: Path, atom: Atom) -> str:
+    """A numbered window of the code an atom came from. Empty when the atom has no place in the code."""
+
+    if not atom.file or not atom.line:
+        return ""
+    try:
+        return read_file(root, atom.file, start_line=max(1, atom.line - 1), line_cap=_EXCERPT_LINES)[:_EXCERPT_CHARS]
+    except Exception:
+        return ""
+
+
+def _candidate_block(root: Path, item: Candidate) -> str:
+    lines = [f"Candidate {item.id}", item.triple_text()]
+    first, second = _excerpt(root, item.source), _excerpt(root, item.other)
+    if first:
+        lines.append(f"Code near the source ({item.source.file}):\n{first}")
+    if second and second != first:
+        lines.append(f"Code near the sink or invariant ({item.other.file}):\n{second}")
+    return "\n".join(lines)
 
 
 def rate_coherence(
@@ -107,15 +137,17 @@ def rate_coherence(
 ) -> None:
     """Ask the model whether each triple can occur here. A missing path caps the score at 2.
 
-    A batch whose reply does not parse, or was cut at `max_output`, is asked again in two halves, down to single
-    candidates; a candidate never rated keeps the floor of 1 and `rated` False, so the report can say how many were."""
+    Each candidate comes with the code around its source and its sink or invariant, so the rating rests on what the
+    tree does and not only on how the atoms are worded. A batch whose reply does not parse, or was cut at `max_output`,
+    is asked again in two halves, down to single candidates; a candidate never rated keeps the floor of 1 and `rated`
+    False, so the report can say how many were."""
 
     for offset in range(0, len(candidates), batch_size):
         _rate_batch(model, root, candidates[offset : offset + batch_size], max_output)
 
 
 def _rate_batch(model: PaidModel, root: Path, batch: list[Candidate], max_output: int) -> None:
-    blocks = [f"Candidate {item.id}\n{item.triple_text()}" for item in batch]
+    blocks = [_candidate_block(root, item) for item in batch]
     user = (
         "STAGE: coherence\n"
         "Rate each candidate from 1 to 5 for whether it can occur on a real call path "
@@ -254,6 +286,113 @@ def _score_pool(
     return apply_scores(candidates)
 
 
+class _Failures:
+    """Consecutive model errors. One failed pass or hunt is skipped; three in a row end the search."""
+
+    def __init__(self, state: RunState, secret: str | None) -> None:
+        self.state = state
+        self.secret = secret
+        self.count = 0
+
+    def ok(self) -> None:
+        self.count = 0
+
+    def bad(self, exc: LLMError, what: str) -> None:
+        self.count += 1
+        self.state.skipped.append(what)
+        log.warning("%s failed: %s", what, redact(str(exc), self.secret))
+        if self.count >= _MAX_CONSECUTIVE_FAILURES:
+            raise exc
+
+
+def _log_claims(local: Path, claims: list[Claim]) -> None:
+    """Append claims, reproducers included, so a run that is killed keeps what it paid for."""
+
+    if not claims:
+        return
+    with (local / "claims.jsonl").open("a", encoding="utf-8") as handle:
+        for claim in claims:
+            handle.write(json.dumps({**claim.public_dict(), "reproducer": claim.reproducer}, sort_keys=True) + "\n")
+
+
+def _stages(
+    paid: PaidModel,
+    state: RunState,
+    checkout: Path,
+    budget: Budget,
+    local: Path,
+    *,
+    seed: int,
+    sample_limit: int,
+    review_rounds: int,
+    plain_temperature: float | None,
+    hunt_rounds: int,
+    hunt_token_cap: int,
+    coherence_batch: int,
+    scanners: bool,
+    max_output: int,
+    min_coherence: float,
+    fallback_hunts: int,
+    secret: str | None,
+) -> None:
+    """The search: atoms, plain reviews, candidates, hunts. Whatever ends it early, `state` holds what was collected."""
+
+    failures = _Failures(state, secret)
+    state.sources, state.sinks, state.invariants, state.mechanisms = extract_atoms(checkout)
+    state.invariants = _filter_invariants(paid, state.invariants)
+    for index in range(_PLAIN_PASSES):
+        try:
+            claims = plain_pass(
+                paid,
+                checkout,
+                index=index,
+                passes=_PLAIN_PASSES,
+                rounds=review_rounds,
+                max_output=max_output,
+                temperature=plain_temperature,
+            )
+        except LLMError as exc:
+            failures.bad(exc, f"plain pass {index + 1}")
+            continue
+        failures.ok()
+        state.claims.extend(claims)
+        _log_claims(local, claims)
+    state.habit_strings = habit_texts(state.claims, checkout, scanners=scanners)
+    habit_vectors = _embed_habits(paid, state.habit_strings)
+    others = [*state.sinks, *state.invariants]
+    pairs = colocated_pairs(state.sources, others, limit=max(1, sample_limit // 4), seed=seed)
+    state.candidates = propose_candidates(paid, pairs, state.mechanisms, seed=seed, max_output=max_output)[:sample_limit]
+    rate_coherence(paid, checkout, state.candidates, batch_size=coherence_batch, max_output=max_output)
+    state.ranked_07, state.ranked_04 = _score_pool(paid, state.candidates, habit_vectors)
+    failures.ok()                                       # the endpoint answered all of that
+    floor = [item for item in state.ranked_07 if (item.coherence or 0) >= min_coherence]
+    state.above_floor = len(floor)
+    if not floor and fallback_hunts:                    # asciitree: nothing reached 3, so nothing was hunted
+        floor = [item for item in state.ranked_07 if item.rated and (item.coherence or 0) >= 2][:fallback_hunts]
+        state.fallback = len(floor)
+    top = floor[:20]
+    state.hunted = top
+    for candidate in top:
+        if budget.should_stop():
+            raise BudgetStop("hunt")
+        try:
+            result = directed_hunt(
+                paid,
+                checkout,
+                candidate,
+                rounds=hunt_rounds,
+                token_cap=hunt_token_cap,
+                max_output=max_output,
+            )
+        except LLMError as exc:
+            candidate.hunt_error = str(redact(str(exc), secret))
+            failures.bad(exc, f"hunt {candidate.id}")
+            continue
+        failures.ok()
+        state.claims.extend(result.claims)
+        _log_claims(local, result.claims)
+
+
 def execute(
     checkout: Path,
     *,
@@ -265,6 +404,7 @@ def execute(
     seed: int = 0,
     sample_limit: int = 80,
     review_rounds: int = 8,
+    plain_temperature: float | None = None,
     hunt_rounds: int = 6,
     hunt_token_cap: int = 8000,
     coherence_batch: int = 10,
@@ -280,7 +420,10 @@ def execute(
     min_coherence: float = 3.0,
     fallback_hunts: int = 3,
 ) -> Path:
-    """Run the pipeline and return the report path."""
+    """Run the pipeline and return the report path.
+
+    Whatever ends the search early (the budget, model errors, an unexpected error, Ctrl-C), the claims already paid for
+    are still confirmed and reported. A model error, an unexpected error or an interrupt is then raised again."""
 
     known = known or []
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -289,54 +432,58 @@ def execute(
     paid = PaidModel(model, budget, prices)
     state = RunState()
     when = commit_time or datetime.now(timezone.utc)
+    failure: BaseException | None = None
     try:
-        state.sources, state.sinks, state.invariants, state.mechanisms = extract_atoms(checkout)
-        state.invariants = _filter_invariants(paid, state.invariants)
-        state.claims.extend(
-            plain_reviews(paid, checkout, rounds=review_rounds, max_output=max_output)
+        _stages(
+            paid,
+            state,
+            checkout,
+            budget,
+            local,
+            seed=seed,
+            sample_limit=sample_limit,
+            review_rounds=review_rounds,
+            plain_temperature=plain_temperature,
+            hunt_rounds=hunt_rounds,
+            hunt_token_cap=hunt_token_cap,
+            coherence_batch=coherence_batch,
+            scanners=scanners,
+            max_output=max_output,
+            min_coherence=min_coherence,
+            fallback_hunts=fallback_hunts,
+            secret=secret,
         )
-        state.habit_strings = habit_texts(state.claims, checkout, scanners=scanners)
-        habit_vectors = _embed_habits(paid, state.habit_strings)
-        others = [*state.sinks, *state.invariants]
-        pairs = colocated_pairs(state.sources, others, limit=max(1, sample_limit // 4), seed=seed)
-        state.candidates = propose_candidates(paid, pairs, state.mechanisms, seed=seed, max_output=max_output)[:sample_limit]
-        rate_coherence(paid, checkout, state.candidates, batch_size=coherence_batch, max_output=max_output)
-        state.ranked_07, state.ranked_04 = _score_pool(paid, state.candidates, habit_vectors)
-        floor = [item for item in state.ranked_07 if (item.coherence or 0) >= min_coherence]
-        state.above_floor = len(floor)
-        if not floor and fallback_hunts:                # asciitree: nothing reached 3, so nothing was hunted
-            floor = [item for item in state.ranked_07 if item.rated and (item.coherence or 0) >= 2][:fallback_hunts]
-            state.fallback = len(floor)
-        top = floor[:20]
-        state.hunted = top
-        for candidate in top:
-            if budget.should_stop():
-                raise BudgetStop("hunt")
-            result = directed_hunt(
-                paid,
-                checkout,
-                candidate,
-                rounds=hunt_rounds,
-                token_cap=hunt_token_cap,
-                max_output=max_output,
-            )
-            state.claims.extend(result.claims)
     except BudgetStop:
         state.stopped = True
         log.info("stopping because 80 percent of the budget is spent")
     except LLMError as exc:
         state.error = str(redact(str(exc), secret))
-        _persist(state, out_dir, budget, known, target, commit, secret, run_id, stopped=state.stopped)
-        raise LLMError(state.error) from None
+        failure = LLMError(state.error)
+    except KeyboardInterrupt as exc:
+        state.error = "interrupted"
+        failure = exc
+        log.warning("interrupted; confirming the %d claims collected so far", len(state.claims))
+    except Exception as exc:
+        state.error = f"{type(exc).__name__}: {redact(str(exc), secret)}"
+        failure = exc
+        log.warning("search failed; confirming the %d claims collected so far", len(state.claims))
 
-    _confirm(state, checkout, out_dir, confirm_mode, container_image, when)
-    texts = [claim.text for claim, confirmation in state.confirmations if confirmation.confirmed]
-    if texts:
-        try:
-            state.confirmed_vectors = paid.embed(texts, stage="score").vectors
-        except (BudgetStop, LLMError):                     # merged by class alone, then
-            state.confirmed_vectors = None
-    return _persist(state, out_dir, budget, known, target, commit, secret, run_id, stopped=state.stopped)
+    try:
+        _confirm(state, checkout, out_dir, confirm_mode, container_image, when)
+        texts = [claim.text for claim, confirmation in state.confirmations if confirmation.confirmed]
+        if texts and not isinstance(failure, KeyboardInterrupt):
+            try:
+                state.confirmed_vectors = paid.embed(texts, stage="score").vectors
+            except (BudgetStop, LLMError):                 # merged by class alone, then
+                state.confirmed_vectors = None
+    except KeyboardInterrupt as exc:
+        log.warning("interrupted during confirmation; the report covers what was confirmed so far")
+        state.error = state.error or "interrupted during confirmation"
+        failure = failure or exc
+    path = _persist(state, out_dir, budget, known, target, commit, secret, run_id, stopped=state.stopped)
+    if failure is not None:
+        raise failure
+    return path
 
 
 def _confirm(
@@ -347,17 +494,24 @@ def _confirm(
     image: str,
     commit_time: datetime,
 ) -> None:
+    if not state.claims:
+        return
     work = out_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
     deps = DepsStatus(True, "not requested")
     if mode == "podman":
-        imports = reproducer_imports([claim.reproducer for claim in state.claims], set(package_names(checkout)))
-        deps = prepare_wheels(checkout, commit_time, work, imports=imports, python_tag=python_tag_for(image))
-        log.info("dependencies: %s", deps.why)
-        if deps.ok and deps.target is not None:
-            failure = install_wheels(image, work, deps)
-            if failure:
-                deps = DepsStatus(False, failure)
+        try:                                               # no install, or a broken one, must not void every claim
+            imports = reproducer_imports([claim.reproducer for claim in state.claims], set(package_names(checkout)))
+            deps = prepare_wheels(checkout, commit_time, work, imports=imports, python_tag=python_tag_for(image))
+            log.info("dependencies: %s", deps.why)
+            if deps.ok and deps.target is not None:
+                failure = install_wheels(image, work, deps)
+                if failure:
+                    deps = DepsStatus(False, failure)
+        except Exception as exc:
+            deps = DepsStatus(False, f"could not prepare dependencies: {exc}")
+        if not deps.ok:
+            log.warning("running the reproducers without dependencies: %s", deps.why)
     for index, claim in enumerate(state.claims):
         slot = work / f"claim-{index}"
         try:
@@ -420,6 +574,7 @@ def _persist(
                 "score_0_4": item.score_0_4,
                 "path_exists": item.path_exists,
                 "incoherent": item.incoherent,
+                "error": item.hunt_error,
             }
             for item in top
         ],
@@ -480,6 +635,7 @@ def _persist(
         confirmed_all=len(confirmed_pairs),
         above_floor=state.above_floor,
         fallback=state.fallback,
+        skipped=state.skipped,
     )
     if state.error:
         report += f"\n## Error\n\n{state.error}\n"

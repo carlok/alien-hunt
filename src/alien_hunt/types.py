@@ -12,6 +12,7 @@ class ToolCall:
     id: str
     name: str
     arguments: dict
+    invalid: bool = False  # the arguments were not a JSON object (a cut-off call, usually)
 
 
 @dataclass
@@ -69,6 +70,7 @@ class Atom:
     text: str
     file: str | None = None
     function: str | None = None
+    line: int | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -93,6 +95,7 @@ class Candidate:
     incoherent: bool | None = None
     path_exists: bool | None = None
     rated: bool = False  # the coherence rating was parsed, not defaulted
+    hunt_error: str | None = None  # the hunt was skipped after this model error
 
     def triple_text(self) -> str:
         return f"{self.source.text} || {self.mechanism.text} || {self.other.text}"

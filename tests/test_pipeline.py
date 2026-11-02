@@ -18,6 +18,7 @@ from samplelib import load_config
 blob = pickle.dumps({"k": 1})
 got = load_config(blob)
 if got == {"k": 1}:
+    print("DEFECT-OBSERVED")
     sys.exit(0)
 sys.exit(1)
 """
@@ -27,6 +28,7 @@ from samplelib import allocate
 
 got = allocate(0)
 if len(got) != 0:
+    print("DEFECT-OBSERVED")
     sys.exit(0)
 sys.exit(1)
 """

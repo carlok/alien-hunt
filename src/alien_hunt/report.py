@@ -97,6 +97,7 @@ def render_report(
     confirmed_all: int | None = None,
     above_floor: int | None = None,
     fallback: int = 0,
+    skipped: list[str] | None = None,
 ) -> str:
     """Markdown metrics. Reproducers and narratives are not included."""
 
@@ -132,6 +133,7 @@ def render_report(
 - Target: {target}
 - Commit: {commit or "local"}
 - Stopped early: {"yes" if stopped else "no"}
+- Skipped after a model error: {", ".join(skipped) if skipped else "none"}
 - Budget USD: {budget.limit_usd:.4f}
 - Spent USD: {budget.spent:.4f}
 

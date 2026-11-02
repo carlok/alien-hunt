@@ -24,6 +24,7 @@ from samplelib import load_config
 blob = pickle.dumps({"k": 1})
 got = load_config(blob)
 if got == {"k": 1}:
+    print("DEFECT-OBSERVED")
     sys.exit(0)
 sys.exit(1)
 """
@@ -33,6 +34,7 @@ from samplelib import allocate
 
 got = allocate(0)
 if len(got) != 0:
+    print("DEFECT-OBSERVED")
     sys.exit(0)
 sys.exit(1)
 """
@@ -75,7 +77,7 @@ def test_local_confirm_accepts_the_length_bug(tmp_path: Path):
 
 
 def test_local_confirm_rejects_a_failing_script(tmp_path: Path):
-    script = "from samplelib import allocate\nallocate(0)\nraise SystemExit(1)\n"
+    script = 'from samplelib import allocate\nif allocate(0):\n    print("DEFECT-OBSERVED")\nraise SystemExit(1)\n'
     result = confirm_local(_claim(["samplelib.allocate"], script), FIXTURE, tmp_path / "work")
     assert not result.confirmed
     assert result.why == "exit status was not 0"
@@ -156,7 +158,7 @@ def test_podman_argv_is_offline_and_read_only(tmp_path: Path):
     assert argv[0] == "podman"
     assert "none" in argv
     assert "--network" in argv
-    for flag in ("--cap-drop=all", "--security-opt=no-new-privileges", "--pids-limit=256", "--memory=2g"):
+    for flag in ("--cap-drop=all", "--security-opt=no-new-privileges", "--pids-limit=256", "--memory=2g", "--cpus=1"):
         assert flag in argv
     assert any(part.endswith(":/src:ro") for part in argv)
     assert any(part.endswith(":/work:ro") for part in argv)

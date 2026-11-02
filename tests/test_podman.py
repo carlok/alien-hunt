@@ -17,6 +17,7 @@ from samplelib import allocate
 
 got = allocate(0)
 if len(got) != 0:
+    print("DEFECT-OBSERVED")
     sys.exit(0)
 sys.exit(1)
 """
