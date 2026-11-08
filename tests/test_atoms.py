@@ -28,6 +28,54 @@ def test_mechanisms_are_original_and_numerous():
     assert "cwe-" not in blob
 
 
+def _library(root: Path, files: dict[str, str]) -> Path:
+    for name, text in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text, encoding="utf-8")
+    return root
+
+
+_HEAVY = (
+    "def heavy_zq(first, second, third):\n"
+    "    out = []\n"
+    "    for item in first:\n"
+    "        if item and second:\n"
+    "            try:\n"
+    "                out.append(step_zq(item, third))\n"
+    "            except ValueError:\n"
+    "                raise RuntimeError('bad')\n"
+    "    return out\n"
+)
+
+
+def test_the_heaviest_functions_keep_their_atoms_when_a_repository_has_more_than_the_caps(tmp_path: Path):
+    files = {f"part{index:03d}.py": "def light_zq(value):\n    return value\n" for index in range(300)}
+    files["zlast.py"] = _HEAVY
+    sources, _sinks, _invariants, _mechanisms = extract_atoms(_library(tmp_path, files))
+    assert len(sources) == 80
+    assert any(item.function == "heavy_zq" for item in sources)
+
+
+def test_a_function_gives_one_source_and_at_most_two_sinks_and_two_invariants(tmp_path: Path):
+    text = (
+        "import pickle\n"
+        "def multi_zq(a, b, c):\n"
+        "    '''Must be short. It never grows. The size is at most ten. It always ends.'''\n"
+        "    pickle.loads(a)\n"
+        "    pickle.loads(b)\n"
+        "    pickle.loads(c)\n"
+    )
+    sources, sinks, invariants, _mechanisms = extract_atoms(_library(tmp_path, {"one.py": text}))
+    assert [item.text for item in sources] == ["caller argument a of multi_zq"]
+    assert len(sinks) == 2 and len(invariants) == 2
+
+
+def test_atoms_stay_in_the_order_the_files_sort(tmp_path: Path):
+    files = {f"part{index:02d}.py": f"def g{index}_zq(value):\n    return step_zq(value)\n" for index in range(5)}
+    sources, _sinks, _invariants, _mechanisms = extract_atoms(_library(tmp_path, files))
+    assert [item.file for item in sources] == [f"part{index:02d}.py" for index in range(5)]
+
+
 def test_fixture_atoms_include_the_planted_pair():
     sources, sinks, invariants, _mechanisms = extract_atoms(FIXTURE)
     source_text = " ".join(item.text for item in sources)

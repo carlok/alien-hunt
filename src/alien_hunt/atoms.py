@@ -173,18 +173,52 @@ def _scope_at(spans: list[tuple[int, int, str]], line: int | None) -> str | None
     return min(inside, key=lambda span: span[1] - span[0])[2] if inside else None
 
 
-def _spread(items: list[Atom], limit: int) -> list[Atom]:
-    if len(items) <= limit:
-        return items
-    step = len(items) / limit
-    return [items[int(index * step)] for index in range(limit)]
+# What a function does: its branches, loops, raises, try blocks and calls. A fix lands in the functions that do the most
+# (on the tuning cases the heaviest ones held the fixed function two to three times as often as an even spread).
+_WORK = (ast.If, ast.Try, ast.Raise, ast.For, ast.AsyncFor, ast.While, ast.Call)
+
+# Where an atom sits: the function around it as (file, line of its `def`), or None at module level, and that function's weight.
+_Seat = tuple[tuple[str, int] | None, int]
+
+
+def _owners(tree: ast.AST) -> dict[int, tuple[int, int]]:
+    """Line -> (line of the `def`, weight) of the innermost function holding that line."""
+
+    funcs = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    funcs.sort(key=lambda node: -((node.end_lineno or node.lineno) - node.lineno))      # outer first: an inner one overwrites
+    owners: dict[int, tuple[int, int]] = {}
+    for func in funcs:
+        entry = (func.lineno, sum(isinstance(node, _WORK) for node in ast.walk(func)))
+        for line in range(func.lineno, (func.end_lineno or func.lineno) + 1):
+            owners[line] = entry
+    return owners
+
+
+def _retain(items: list[Atom], limit: int, seats: dict[str, _Seat], *, per_function: int) -> list[Atom]:
+    """At most `limit` atoms: those in the heaviest functions first, `per_function` at most from any one function, so a
+    repository's atoms reach many functions instead of every Nth atom of the sorted file list. Kept in the order found."""
+
+    ranked = sorted(range(len(items)), key=lambda index: (-seats[items[index].id][1], index))
+    taken: dict[tuple[str, int], int] = {}
+    kept: list[int] = []
+    for index in ranked:
+        owner = seats[items[index].id][0]
+        if owner is not None:
+            if taken.get(owner, 0) >= per_function:
+                continue
+            taken[owner] = taken.get(owner, 0) + 1
+        kept.append(index)
+        if len(kept) >= limit:
+            break
+    return [items[index] for index in sorted(kept)]
 
 
 def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[Atom]]:
     """Return sources, sinks, docstring invariants, and mechanisms present for this tree.
 
     Sources and sinks are only those the AST actually finds. Mechanisms are the
-    fixed list, because they are generic defect shapes rather than calls.
+    fixed list, because they are generic defect shapes rather than calls. A repository with more atoms than the caps
+    allow keeps those of its heaviest functions (see `_retain`).
     """
 
     sources: list[Atom] = []
@@ -192,6 +226,8 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
     invariants: list[Atom] = []
     seen: set[str] = set()
     spans: list[tuple[int, int, str]] = []          # the functions of the file being read
+    seats: dict[str, _Seat] = {}
+    owners: dict[int, tuple[int, int]] = {}
 
     def add(bucket: list[Atom], atom: Atom) -> None:
         if atom.id in seen:
@@ -199,6 +235,8 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
         seen.add(atom.id)
         atom.scope = _scope_at(spans, atom.line)
         bucket.append(atom)
+        entry = owners.get(atom.line) if atom.line is not None else None
+        seats[atom.id] = ((str(atom.file), entry[0]), entry[1]) if entry else (None, -1)
 
     for path in _py_files(root):
         relative = str(path.relative_to(root))
@@ -207,6 +245,7 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
         except SyntaxError:
             continue
         spans[:] = _function_spans(tree)
+        owners = _owners(tree)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for atom in _input_sinks(node, relative):
@@ -298,9 +337,9 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
                     ),
                 )
     return (
-        _spread(sources, 80),
-        _spread(sinks, 80),
-        _spread(invariants, 40),
+        _retain(sources, 80, seats, per_function=1),
+        _retain(sinks, 80, seats, per_function=2),
+        _retain(invariants, 40, seats, per_function=2),
         load_mechanisms(),
     )
 
