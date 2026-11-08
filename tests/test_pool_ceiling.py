@@ -196,6 +196,21 @@ def test_summaries_are_rates_over_the_cases_that_have_a_target():
     assert "| x | 2 |" in pc.render_table(overall, families)
 
 
+def test_the_small_fix_slice_leaves_out_the_huge_commits():
+    many = [f"f.py:g{i}:1-2" for i in range(6)]
+    records = [
+        {"status": "ok", "targets": ["f.py:a:1-2"], "atom_hit": True, "atom_hit_literal": True, "pair_hit": True,
+         "drawn_hit": 0.0, "pool_size": 10, "touching_pairs": 1, "touch_share": 0.1},
+        {"status": "ok", "targets": many, "atom_hit": True, "atom_hit_literal": True, "pair_hit": True,
+         "drawn_hit": 1.0, "pool_size": 10, "touching_pairs": 9, "touch_share": 0.9},
+        {"status": "no_targets", "targets": []},
+    ]
+    small = pc.summarize(pc.small_fixes(records))
+    assert (small["measured"], small["drawn_hit"]) == (1, 0.0)
+    assert pc.summarize(records)["drawn_hit"] == 0.5
+    assert "fix of at most 5 functions" in pc.render_table(pc.summarize(records), {}, {"fix of at most 5 functions": small})
+
+
 def test_measure_reads_a_folder_of_cases_and_filters_by_split_and_family(tmp_path: Path, capsys):
     cases = tmp_path / "cases"
     for name, family, split in (("g1", "injection", "tune"), ("g2", "injection", "heldout"), ("g3", "crypto", "tune")):
@@ -205,7 +220,9 @@ def test_measure_reads_a_folder_of_cases_and_filters_by_split_and_family(tmp_pat
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert sorted(rec["id"] for rec in payload["cases"]) == ["g1", "g3"]
     assert payload["overall"]["measured"] == 2 and set(payload["by_family"]) == {"crypto", "injection"}
-    assert "| all | 2 |" in capsys.readouterr().out
+    shown = capsys.readouterr().out
+    assert "| all | 2 |" in shown and "| fix of at most 5 functions | 2 |" in shown
+    assert "small_fix" in payload
     pc.main(["measure", str(cases), "--json", str(out), "--jobs", "1", "--family", "injection"])
     assert sorted(rec["id"] for rec in json.loads(out.read_text(encoding="utf-8"))["cases"]) == ["g1", "g2"]
 
@@ -266,3 +283,43 @@ def test_the_documented_isolated_command_works_with_src_and_a_process_pool(tmp_p
     assert done.returncode == 0, done.stderr
     assert "| all | 3 |" in done.stdout
     assert [rec["status"] for rec in json.loads(out.read_text(encoding="utf-8"))["cases"]] == ["ok"] * 3
+
+
+def _rec(ident, drawn, share, family="f", status="ok"):
+    return {"id": ident, "family": family, "status": status, "targets": ["a:b:1-2"], "atom_hit": drawn > 0,
+            "atom_hit_literal": drawn > 0, "pair_hit": drawn > 0, "drawn_hit": drawn, "pool_size": 100,
+            "touching_pairs": int(share * 100), "touch_share": share}
+
+
+def test_compare_keeps_a_change_that_raises_drawn_hit_and_holds_dilution():
+    before = {"cases": [_rec("a", 0.0, 0.10), _rec("b", 0.5, 0.10), _rec("only-before", 1.0, 0.5)]}
+    after = {"cases": [_rec("a", 0.5, 0.09), _rec("b", 0.5, 0.09), _rec("only-after", 0.0, 0.0)]}
+    result = pc.compare(before, after)
+    assert result["cases"] == 2 and result["keep"] is True
+    assert result["before"]["drawn_hit"] == 0.25 and result["after"]["drawn_hit"] == 0.5
+    text = pc.render_comparison(result)
+    assert "| drawn_hit | 25.0% | 50.0% | +25.0 pts |" in text and "keep: yes" in text
+
+
+def test_compare_rejects_a_change_that_dilutes_the_pool_by_more_than_a_fifth():
+    before = {"cases": [_rec("a", 0.0, 0.10), _rec("b", 0.5, 0.10)]}
+    after = {"cases": [_rec("a", 1.0, 0.07), _rec("b", 0.5, 0.07)]}
+    result = pc.compare(before, after)
+    assert result["keep"] is False and "touch_share fell" in result["why"]
+    edge = pc.compare(before, {"cases": [_rec("a", 1.0, 0.08), _rec("b", 0.5, 0.08)]})
+    assert edge["keep"] is True                                    # exactly four fifths is allowed
+
+
+def test_compare_rejects_a_change_that_does_not_raise_drawn_hit_or_measures_nothing():
+    before = {"cases": [_rec("a", 0.5, 0.10)]}
+    assert pc.compare(before, {"cases": [_rec("a", 0.5, 0.20)]})["why"] == "drawn_hit did not rise"
+    nothing = pc.compare(before, {"cases": [_rec("z", 1.0, 0.1)]})
+    assert nothing["keep"] is False and nothing["why"] == "no case was measured in both"
+
+
+def test_compare_reads_two_result_files(tmp_path: Path, capsys):
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    a.write_text(json.dumps({"cases": [_rec("a", 0.0, 0.1)]}), encoding="utf-8")
+    b.write_text(json.dumps({"cases": [_rec("a", 1.0, 0.1)]}), encoding="utf-8")
+    assert pc.main(["compare", str(a), str(b)]) == 0
+    assert "keep: yes" in capsys.readouterr().out

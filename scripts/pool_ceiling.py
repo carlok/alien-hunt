@@ -20,6 +20,10 @@ Only `ast` parses the target code. Nothing in a case directory is imported or ru
 
     python -I scripts/pool_ceiling.py measure CASES [--json out.json] [--src DIR] [--family F] [--split S]
     python -I scripts/pool_ceiling.py explain CASES/GHSA-xxxx-xxxx-xxxx [--src DIR]
+    python -I scripts/pool_ceiling.py compare BEFORE.json AFTER.json
+
+`compare` keeps a change only if drawn_hit rises and touch_share stays at least four fifths of what it was, over the cases
+both files measured.
 
 CASES holds one folder per case: `before/`, `after/` and `case.json` ({"id", "family", "split", ...}).
 `--src` puts another checkout's `src/` first on the path, to measure a change in a worktree.
@@ -222,11 +226,67 @@ def summarize(records: list[dict]) -> dict:
     return out
 
 
+SMALL_FIX = 5
+
+
+def small_fixes(records: list[dict]) -> list[dict]:
+    """Cases whose fix changes at most SMALL_FIX functions. A few huge commits (a refactor, a reformat) change hundreds and
+    are hit by almost any pool, which lifts the headline; the median fix changes two."""
+
+    return [rec for rec in records if rec.get("status") == "ok" and len(rec.get("targets") or []) <= SMALL_FIX]
+
+
 def by_family(records: list[dict]) -> dict[str, dict]:
     groups: dict[str, list[dict]] = defaultdict(list)
     for rec in records:
         groups[rec.get("family") or "other"].append(rec)
     return {name: summarize(items) for name, items in sorted(groups.items())}
+
+
+KEEP_FLOOR = 0.8        # touch_share may fall by at most a fifth
+
+
+def compare(before: dict, after: dict, *, floor: float = KEEP_FLOOR) -> dict:
+    """The rates before and after over the cases both files measured, and whether the change is kept: drawn_hit must rise
+    and touch_share ("dilution", higher is better) must stay at least `floor` of what it was."""
+
+    def measured(payload: dict) -> dict[str, dict]:
+        return {rec["id"]: rec for rec in payload["cases"] if rec.get("status") == "ok" and rec.get("id")}
+
+    old, new = measured(before), measured(after)
+    common = sorted(old.keys() & new.keys())
+    old_rates, new_rates = summarize([old[i] for i in common]), summarize([new[i] for i in common])
+    families = {
+        name: (summarize([old[i] for i in common if (old[i].get("family") or "other") == name]),
+               summarize([new[i] for i in common if (new[i].get("family") or "other") == name]))
+        for name in sorted({old[i].get("family") or "other" for i in common})
+    }
+    verdict = {"cases": len(common), "before": old_rates, "after": new_rates, "families": families}
+    if not common:
+        return {**verdict, "keep": False, "why": "no case was measured in both"}
+    rose = new_rates["drawn_hit"] > old_rates["drawn_hit"]
+    held = new_rates["touch_share"] >= floor * old_rates["touch_share"] - 1e-9      # not a rounding error
+    why = [] if rose else ["drawn_hit did not rise"]
+    if not held:
+        why.append(f"touch_share fell below {floor:.0%} of {_pct(old_rates['touch_share'])}")
+    return {**verdict, "keep": rose and held, "why": "; ".join(why) or "drawn_hit rose and touch_share held"}
+
+
+def render_comparison(result: dict) -> str:
+    lines = [f"{result['cases']} cases measured in both", "| rate | before | after | change |", "|---|---|---|---|"]
+    for key in ("atom_hit", "pair_hit", "drawn_hit", "touch_share"):
+        old, new = result["before"].get(key), result["after"].get(key)
+        if old is None or new is None:
+            continue
+        lines.append(f"| {key} | {_pct(old)} | {_pct(new)} | {100 * (new - old):+.1f} pts |")
+    if result["before"].get("mean_pool_size") is not None:
+        lines.append(f"| pool | {result['before']['mean_pool_size']:.0f} | {result['after']['mean_pool_size']:.0f} | |")
+    for name, (old, new) in result["families"].items():
+        if old.get("measured"):
+            lines.append(f"| {name} drawn_hit ({old['measured']} cases) | {_pct(old['drawn_hit'])} | {_pct(new['drawn_hit'])} | "
+                         f"{100 * (new['drawn_hit'] - old['drawn_hit']):+.1f} pts |")
+    lines.append(f"keep: {'yes' if result['keep'] else 'no'} ({result['why']})")
+    return "\n".join(lines)
 
 
 def load_cases(root: Path, *, family: str | None = None, split: str | None = None) -> list[tuple[dict, Path, Path]]:
@@ -273,10 +333,10 @@ def _pct(value: float | None) -> str:
     return "n/a" if value is None else f"{100 * value:.1f}%"
 
 
-def render_table(overall: dict, families: dict[str, dict]) -> str:
+def render_table(overall: dict, families: dict[str, dict], extra: dict[str, dict] | None = None) -> str:
     head = "| group | cases | atom_hit | pair_hit | drawn_hit | pool | touch_share |\n|---|---|---|---|---|---|---|\n"
     rows = []
-    for name, stats in [("all", overall), *families.items()]:
+    for name, stats in [("all", overall), *(extra or {}).items(), *families.items()]:
         if not stats.get("measured"):
             rows.append(f"| {name} | 0 | | | | | |")
             continue
@@ -314,23 +374,31 @@ def main(argv: list[str] | None = None) -> int:
     measure.add_argument("--sample-limit", type=int, default=SAMPLE_LIMIT)
     measure.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     measure.add_argument("--src", type=Path, help="use this checkout's src/ instead of the installed package")
+    cmp = sub.add_parser("compare", help="compare two result files and say whether the change is kept")
+    cmp.add_argument("before", type=Path)
+    cmp.add_argument("after", type=Path)
     show = sub.add_parser("explain", help="list a case's fix functions and the atoms in them")
     show.add_argument("case", type=Path)
     show.add_argument("--sample-limit", type=int, default=SAMPLE_LIMIT)
     show.add_argument("--src", type=Path)
     args = parser.parse_args(argv)
+    if args.command == "compare":
+        result = compare(json.loads(args.before.read_text(encoding="utf-8")), json.loads(args.after.read_text(encoding="utf-8")))
+        print(render_comparison(result))
+        return 0
     if args.command == "explain":
         print(explain(args.case, src=args.src, sample_limit=args.sample_limit))
         return 0
     cases = load_cases(args.cases, family=args.family, split=args.split)
     records = measure_all(cases, src=args.src, seeds=args.seeds, sample_limit=args.sample_limit, jobs=args.jobs)
     overall, families = summarize(records), by_family(records)
-    print(render_table(overall, families))
+    small = summarize(small_fixes(records))
+    print(render_table(overall, families, {f"fix of at most {SMALL_FIX} functions": small}))
     errors = [rec for rec in records if rec.get("status") == "error"]
     if errors:
         print(f"{len(errors)} cases failed: " + ", ".join(rec["id"] or "?" for rec in errors[:10]), file=sys.stderr)
     if args.json:
-        payload = {"overall": overall, "by_family": families, "cases": records}
+        payload = {"overall": overall, "small_fix": small, "by_family": families, "cases": records}
         args.json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 
