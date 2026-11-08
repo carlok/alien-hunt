@@ -285,6 +285,55 @@ def test_the_documented_isolated_command_works_with_src_and_a_process_pool(tmp_p
     assert [rec["status"] for rec in json.loads(out.read_text(encoding="utf-8"))["cases"]] == ["ok"] * 3
 
 
+def test_src_takes_a_checkout_or_its_src_folder_and_refuses_anything_else(tmp_path: Path):
+    checkout = tmp_path / "checkout"
+    (checkout / "src" / "alien_hunt").mkdir(parents=True)
+    (checkout / "src" / "alien_hunt" / "atoms.py").write_text("", encoding="utf-8")
+    assert pc.package_root(checkout) == (checkout / "src").resolve()
+    assert pc.package_root(checkout / "src") == (checkout / "src").resolve()
+    with pytest.raises(ValueError, match="no alien_hunt package"):
+        pc.package_root(tmp_path / "elsewhere")
+
+
+def test_a_checkout_given_to_src_is_the_copy_that_gets_measured(tmp_path: Path):
+    import shutil
+
+    checkout = tmp_path / "checkout"
+    shutil.copytree(ROOT / "src" / "alien_hunt", checkout / "src" / "alien_hunt", ignore=shutil.ignore_patterns("__pycache__"))
+    code = f"""
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("pc", {str(SCRIPT)!r})
+module = importlib.util.module_from_spec(spec)
+sys.modules["pc"] = module
+spec.loader.exec_module(module)
+atoms, score = module.load_alien_hunt(__import__("pathlib").Path({str(checkout)!r}))
+print(atoms.__file__)
+print(module.package_dir(__import__("pathlib").Path({str(checkout)!r})))
+"""
+    done = run_isolated(code)
+    assert done.returncode == 0, done.stderr
+    loaded, recorded = done.stdout.split()
+    assert Path(loaded).resolve().is_relative_to((checkout / "src").resolve())
+    assert recorded == str((checkout / "src" / "alien_hunt").resolve())
+
+
+def test_the_command_line_stops_on_a_src_with_no_package_and_records_the_copy_it_measured(tmp_path: Path):
+    cases = tmp_path / "cases"
+    make_case(cases, "c10", {"pkg/m.py": POOL_BEFORE}, {"pkg/m.py": POOL_AFTER}, family="f", split="tune")
+    bad = subprocess.run(
+        [sys.executable, "-I", str(SCRIPT), "measure", str(cases), "--src", str(tmp_path / "nothing"), "--jobs", "1"],
+        capture_output=True, text=True, check=False,
+    )
+    assert bad.returncode != 0 and "no alien_hunt package" in bad.stderr
+    out = tmp_path / "out.json"
+    good = subprocess.run(
+        [sys.executable, "-I", str(SCRIPT), "measure", str(cases), "--src", str(ROOT), "--jobs", "1", "--json", str(out)],
+        capture_output=True, text=True, check=False,
+    )
+    assert good.returncode == 0, good.stderr
+    assert json.loads(out.read_text(encoding="utf-8"))["package"] == str((ROOT / "src" / "alien_hunt").resolve())
+
+
 def _rec(ident, drawn, share, family="f", status="ok"):
     return {"id": ident, "family": family, "status": status, "targets": ["a:b:1-2"], "atom_hit": drawn > 0,
             "atom_hit_literal": drawn > 0, "pair_hit": drawn > 0, "drawn_hit": drawn, "pool_size": 100,

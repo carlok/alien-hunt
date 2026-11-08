@@ -26,7 +26,8 @@ Only `ast` parses the target code. Nothing in a case directory is imported or ru
 both files measured.
 
 CASES holds one folder per case: `before/`, `after/` and `case.json` ({"id", "family", "split", ...}).
-`--src` puts another checkout's `src/` first on the path, to measure a change in a worktree.
+`--src` takes another checkout (or its `src/`) and measures its alien_hunt instead of the installed one, to test a change
+in a worktree. A folder with no alien_hunt in it is an error, and the result file records which copy was measured.
 """
 
 from __future__ import annotations
@@ -48,14 +49,40 @@ SAMPLE_LIMIT = 80          # alien-hunt's default `sample_limit`, which sets the
 NO_LIMIT = 10**9
 
 
+def package_root(src: Path) -> Path:
+    """The folder that holds the `alien_hunt` package: `src` itself, or the `src/` of a checkout. A path with neither is
+    an error, because the import would otherwise fall back to whatever copy is installed and measure that instead."""
+
+    src = Path(src).resolve()
+    for candidate in (src, src / "src"):
+        if (candidate / "alien_hunt" / "atoms.py").is_file():
+            return candidate
+    raise ValueError(f"--src {src}: no alien_hunt package in it or in its src/")
+
+
 def load_alien_hunt(src: Path | None = None) -> tuple[ModuleType, ModuleType]:
     """The pool's own modules. Neither imports a model client."""
 
+    root = None
     if src is not None:
-        sys.path.insert(0, str(Path(src).resolve()))
+        root = package_root(src)
+        sys.path.insert(0, str(root))
     from alien_hunt import atoms, score
 
+    if root is not None and not Path(atoms.__file__).resolve().is_relative_to(root):
+        raise ValueError(f"alien_hunt was loaded from {atoms.__file__}, not from {root}")
     return atoms, score
+
+
+def package_dir(src: Path | None) -> str:
+    """Which copy of alien_hunt a run measures, for the record in the result file."""
+
+    if src is not None:
+        return str(package_root(src) / "alien_hunt")
+    import importlib.util
+
+    spec = importlib.util.find_spec("alien_hunt")
+    return str(Path(spec.origin).parent) if spec and spec.origin else "unknown"
 
 
 @dataclass(frozen=True)
@@ -373,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
     measure.add_argument("--seeds", type=int, default=SEEDS)
     measure.add_argument("--sample-limit", type=int, default=SAMPLE_LIMIT)
     measure.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
-    measure.add_argument("--src", type=Path, help="use this checkout's src/ instead of the installed package")
+    measure.add_argument("--src", type=Path, help="measure this checkout's alien_hunt (the checkout or its src/) instead of the installed one")
     cmp = sub.add_parser("compare", help="compare two result files and say whether the change is kept")
     cmp.add_argument("before", type=Path)
     cmp.add_argument("after", type=Path)
@@ -382,6 +409,11 @@ def main(argv: list[str] | None = None) -> int:
     show.add_argument("--sample-limit", type=int, default=SAMPLE_LIMIT)
     show.add_argument("--src", type=Path)
     args = parser.parse_args(argv)
+    if getattr(args, "src", None) is not None:
+        try:
+            package_root(args.src)
+        except ValueError as exc:
+            parser.error(str(exc))
     if args.command == "compare":
         result = compare(json.loads(args.before.read_text(encoding="utf-8")), json.loads(args.after.read_text(encoding="utf-8")))
         print(render_comparison(result))
@@ -398,7 +430,8 @@ def main(argv: list[str] | None = None) -> int:
     if errors:
         print(f"{len(errors)} cases failed: " + ", ".join(rec["id"] or "?" for rec in errors[:10]), file=sys.stderr)
     if args.json:
-        payload = {"overall": overall, "small_fix": small, "by_family": families, "cases": records}
+        payload = {"package": package_dir(args.src), "overall": overall, "small_fix": small, "by_family": families,
+                   "cases": records}
         args.json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 
