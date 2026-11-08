@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import configparser
+import functools
 import hashlib
 import json
 import logging
@@ -40,28 +41,54 @@ _RUNNER = r'''
 import json
 import os
 import sys
+import threading
 import traceback
 
 repro_path, calls_path, checkout = sys.argv[1], sys.argv[2], sys.argv[3]
+sites_path = os.path.splitext(calls_path)[0] + ".sites.json"
 root = os.path.realpath(checkout)
 calls = []
+sites = []
+seen_sites = set()
+resolved_files = {}
+imports_running = [0]       # what an import runs is the library starting up, not the script calling it
 
-def tracer(frame, event, arg):
-    if event == "call":
-        filename = frame.f_code.co_filename or ""
+def library_file(filename):
+    # a real file under the checkout: code the script compiled under a library path is not that file's code
+    if filename not in resolved_files:
         try:
             resolved = os.path.realpath(filename)
         except OSError:
             resolved = filename
-        inside = resolved == root or resolved.startswith(root + os.sep)
-        if inside and frame.f_code.co_flags & 1:  # CO_OPTIMIZED: a function, not a module or class body run by the import
-            calls.append(f"{resolved}:{frame.f_code.co_name}")
-    return tracer
+        inside = resolved.startswith(root + os.sep) and os.path.isfile(resolved)
+        resolved_files[filename] = resolved if inside else ""
+    return resolved_files[filename]
+
+def leave(frame, event, arg):
+    if event == "return":
+        imports_running[0] -= 1
+    return leave
+
+def tracer(frame, event, arg):
+    code = frame.f_code
+    filename = code.co_filename or ""
+    if filename.startswith("<frozen importlib"):
+        imports_running[0] += 1
+        return leave
+    if imports_running[0] == 0 and code.co_flags & 1:   # CO_OPTIMIZED: a function, not a module or class body
+        resolved = library_file(filename)
+        if resolved:
+            calls.append(f"{resolved}:{code.co_name}")
+            if (resolved, code.co_firstlineno) not in seen_sites:
+                seen_sites.add((resolved, code.co_firstlineno))
+                sites.append([resolved, code.co_firstlineno])
+    return None
 
 status = 1
 try:
     with open(repro_path, encoding="utf-8") as handle:
         code = compile(handle.read(), repro_path, "exec")
+    threading.settrace(tracer)
     sys.settrace(tracer)
     exec(code, {"__name__": "__main__", "__file__": repro_path})
     status = 0
@@ -80,6 +107,8 @@ finally:
     sys.settrace(None)
     with open(calls_path, "w", encoding="utf-8") as handle:
         json.dump(calls, handle)
+    with open(sites_path, "w", encoding="utf-8") as handle:
+        json.dump(sites, handle)
 raise SystemExit(status)
 '''
 
@@ -115,51 +144,367 @@ def linux_arch() -> str:
     return machine
 
 
-def _decides_nothing(test: ast.expr) -> bool:
-    """`if __name__ == "__main__"` always runs (the runner executes the script as __main__), and so does `if True`."""
+CHANGES = "reproducer replaces or changes repository code or what it returned"
 
-    if isinstance(test, ast.Constant):
+_MUTATORS = frozenset(
+    {"append", "extend", "insert", "pop", "remove", "clear", "update", "add", "discard", "sort", "reverse", "setdefault",
+     "popitem"}
+)
+_UNKNOWN = object()
+
+
+def _root_name(node: ast.AST) -> str | None:
+    """The name an expression starts from: `pkg.mod.f` and `Cls(1).go` both start from their first Name."""
+
+    while True:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
+            node = node.value
+        elif isinstance(node, ast.Call):
+            node = node.func
+        else:
+            return None
+
+
+def _target_names(target: ast.AST) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for item in target.elts for name in _target_names(item)]
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    return []
+
+
+def _flatten(target: ast.AST) -> list[ast.AST]:
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [leaf for item in target.elts for leaf in _flatten(item)]
+    if isinstance(target, ast.Starred):
+        return _flatten(target.value)
+    return [target]
+
+
+_COLLECT = frozenset({"append", "appendleft", "extend", "extendleft", "insert", "add", "update", "setdefault"})
+
+
+def _empty_container(node: ast.AST) -> bool:
+    if isinstance(node, (ast.List, ast.Set)):
+        return not node.elts
+    if isinstance(node, ast.Dict):
+        return not node.keys
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("list", "dict", "set") \
+        and not node.args and not node.keywords
+
+
+class _Script:
+    """What a reproducer's names stand for: which come from the repository, and which hold something it returned.
+
+    A name holds a repository result when every assignment to it is made from the repository's names or from other such
+    names (`size = len(got); size = size + 1` counts). A list or dict the script starts empty and only feeds with such
+    results holds them too, which is how a thread hands one back. A function the script defines is a repository call when
+    its body calls the repository."""
+
+    def __init__(self, tree: ast.AST, packages: set[str]) -> None:
+        self.tree = tree
+        self.bound: set[str] = set()                       # bound by importing the repository
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                self.bound.update(alias.asname or alias.name.split(".")[0] for alias in node.names
+                                  if alias.name.split(".")[0] in packages)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or "").split(".")[0] in packages:
+                self.bound.update(alias.asname or alias.name for alias in node.names)
+        self.repo = set(self.bound)                        # plus aliases such as `orig = pkg.mod.f`
+        entries: dict[str, list[tuple[str, ast.AST | None]]] = {}
+        functions: list[ast.AST] = []
+
+        def note(name: str, kind: str, expr: ast.AST | None) -> None:
+            entries.setdefault(name, []).append((kind, expr))
+
+        def assign(target: ast.AST, value: ast.AST | None) -> None:
+            for name in _target_names(target):
+                if value is not None and _empty_container(value):
+                    entries.setdefault(name, [])
+                else:
+                    note(name, "assign", value)
+            if isinstance(target, ast.Subscript) and isinstance(_root_name(target), str) and value is not None:
+                note(_root_name(target), "write", value)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    assign(target, node.value)
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                assign(node.target, node.value)
+            elif isinstance(node, ast.AugAssign):
+                assign(node.target, None)
+            elif isinstance(node, ast.NamedExpr):
+                note(node.target.id, "assign", node.value)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                assign(node.target, node.iter)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        assign(item.optional_vars, item.context_expr)
+            elif isinstance(node, (ast.Try, ast.TryStar)):  # `except E as exc`: exc comes from what the body called
+                for handler in node.handlers:
+                    if handler.name:
+                        note(handler.name, "assign", ast.Module(body=list(node.body), type_ignores=[]))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions.append(node)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _COLLECT \
+                    and isinstance(node.func.value, ast.Name):
+                for argument in [*node.args, *(keyword.value for keyword in node.keywords)]:
+                    note(node.func.value.id, "write", argument)
+        for name, items in entries.items():                # `orig = samplelib.allocate`: an alias, not a result
+            values = [expr for kind, expr in items if kind == "assign"]
+            if values and all(isinstance(v, (ast.Name, ast.Attribute)) and _root_name(v) in self.repo for v in values):
+                self.repo.add(name)
+        self.tainted: set[str] = set()
+        self.returned: set[str] = set()                    # tainted by assignment, so what the repository itself handed over
+        self.helpers: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for name, items in entries.items():
+                if name in self.tainted or name in self.repo:
+                    continue
+                values = [expr for kind, expr in items if kind == "assign"]
+                writes = [expr for kind, expr in items if kind == "write"]
+                if values:
+                    if all(v is not None and self.derived(v, name) for v in values) and any(
+                            v is not None and self.derived(v) for v in values):
+                        self.tainted.add(name)
+                        self.returned.add(name)
+                        changed = True
+                elif writes and all(self.derived(w) for w in writes):
+                    self.tainted.add(name)
+                    changed = True
+            for function in functions:
+                if function.name not in self.helpers and function.name not in self.bound and \
+                        any(self.derived(statement) for statement in function.body):
+                    self.helpers.add(function.name)
+                    changed = True
+
+    def derived(self, node: ast.AST, also: str | None = None) -> bool:
+        """True when the expression reads a repository name, something a repository call returned, or a helper that calls
+        the repository. `also` is a name to count as derived, for an assignment that reads its own target."""
+
+        names = self.repo | self.tainted | self.helpers | ({also} if also else set())
+        return any(isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load) and sub.id in names for sub in ast.walk(node))
+
+    def calls_repository(self, node: ast.AST) -> bool:
+        names = self.repo | self.tainted | self.helpers
+        return any(isinstance(sub, ast.Call) and _root_name(sub.func) in names for sub in ast.walk(node))
+
+    def changes_repository(self) -> bool:
+        """The script patches, shadows or subclasses repository code, or edits what a repository call handed it."""
+
+        touched = self.repo | self.returned
+        for node in ast.walk(self.tree):
+            if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+                targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+                for leaf in [leaf for target in targets for leaf in _flatten(target)]:
+                    if isinstance(leaf, ast.Name):
+                        if leaf.id in self.bound:
+                            return True
+                    elif isinstance(leaf, (ast.Attribute, ast.Subscript)) and _root_name(leaf) in touched:
+                        return True
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name in self.bound:
+                    return True
+                if isinstance(node, ast.ClassDef) and any(_root_name(base) in touched for base in node.bases):
+                    return True
+            elif isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id in ("setattr", "delattr") and node.args \
+                        and _root_name(node.args[0]) in touched:
+                    return True
+                if isinstance(func, ast.Attribute) and func.attr in _MUTATORS and _root_name(func.value) in self.returned:
+                    return True
+        return False
+
+
+def _value(node: ast.AST):
+    """The value of an expression made only of literals, or _UNKNOWN. Nothing is evaluated by Python: each node type is
+    handled here, so a model's script is read and never run."""
+
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        items = [_value(item) for item in node.elts]
+        if any(item is _UNKNOWN for item in items):
+            return _UNKNOWN
+        try:
+            return tuple(items) if isinstance(node, ast.Tuple) else list(items) if isinstance(node, ast.List) else frozenset(items)
+        except TypeError:
+            return _UNKNOWN
+    if isinstance(node, ast.UnaryOp):
+        operand = _value(node.operand)
+        if operand is _UNKNOWN:
+            return _UNKNOWN
+        try:
+            return {ast.Not: lambda v: not v, ast.USub: lambda v: -v, ast.UAdd: lambda v: +v}[type(node.op)](operand)
+        except (KeyError, TypeError):
+            return _UNKNOWN
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+        left, right = _value(node.left), _value(node.right)
+        numbers = (int, float)
+        if isinstance(left, numbers) and isinstance(right, numbers) and abs(left) < 10**6 and abs(right) < 10**6:
+            return left + right if isinstance(node.op, ast.Add) else left - right if isinstance(node.op, ast.Sub) else left * right
+        if isinstance(node.op, ast.Add) and type(left) is type(right) and isinstance(left, (str, tuple, list)) \
+                and len(left) + len(right) < 10**4:
+            return left + right
+        return _UNKNOWN
+    if isinstance(node, ast.Compare):
+        values = [_value(node.left), *[_value(c) for c in node.comparators]]
+        if any(v is _UNKNOWN for v in values):
+            return _UNKNOWN
+        ops = {ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b, ast.Lt: lambda a, b: a < b,
+               ast.LtE: lambda a, b: a <= b, ast.Gt: lambda a, b: a > b, ast.GtE: lambda a, b: a >= b,
+               ast.Is: lambda a, b: a is b, ast.IsNot: lambda a, b: a is not b, ast.In: lambda a, b: a in b,
+               ast.NotIn: lambda a, b: a not in b}
+        try:
+            return all(ops[type(op)](values[i], values[i + 1]) for i, op in enumerate(node.ops))
+        except (KeyError, TypeError):
+            return _UNKNOWN
+    if isinstance(node, ast.BoolOp):
+        truth = _truth(node)
+        return _UNKNOWN if truth is None else truth
+    if isinstance(node, ast.IfExp):
+        test = _value(node.test)
+        return _UNKNOWN if test is _UNKNOWN else _value(node.body if test else node.orelse)
+    if isinstance(node, ast.NamedExpr):
+        return _value(node.value)
+    if isinstance(node, ast.JoinedStr):
+        parts = [_value(part.value) if isinstance(part, ast.FormattedValue) else _value(part) for part in node.values]
+        return _UNKNOWN if any(part is _UNKNOWN for part in parts) else "".join(str(part) for part in parts)
+    if isinstance(node, ast.Subscript):
+        base, index = _value(node.value), _value(node.slice)
+        if base is _UNKNOWN or index is _UNKNOWN:
+            return _UNKNOWN
+        try:
+            return base[index]
+        except (TypeError, IndexError, KeyError):
+            return _UNKNOWN
+    if isinstance(node, ast.Call):
+        func = node.func
+        if isinstance(func, ast.Lambda) and not node.args and not node.keywords and not func.args.args:
+            return _value(func.body)
+        if isinstance(func, ast.Name) and func.id in ("bool", "len") and len(node.args) == 1 and not node.keywords:
+            arg = _value(node.args[0])
+            if arg is _UNKNOWN:
+                return _UNKNOWN
+            try:
+                return bool(arg) if func.id == "bool" else len(arg)
+            except TypeError:
+                return _UNKNOWN
+    return _UNKNOWN
+
+
+def _truth(node: ast.AST):
+    """True or False when the test comes out the same whatever a repository call returns, else None."""
+
+    value = _value(node) if not isinstance(node, ast.BoolOp) else _UNKNOWN
+    if value is not _UNKNOWN:
+        return bool(value)
+    if isinstance(node, ast.BoolOp):
+        results = [_truth(item) for item in node.values]
+        if isinstance(node.op, ast.Or):
+            return True if any(r is True for r in results) else False if all(r is False for r in results) else None
+        return False if any(r is False for r in results) else True if all(r is True for r in results) else None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        inner = _truth(node.operand)
+        return None if inner is None else not inner
+    if isinstance(node, ast.NamedExpr):
+        return _truth(node.value)
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.left, ast.Call) \
+            and isinstance(node.left.func, ast.Name) and node.left.func.id == "len" and len(node.left.args) == 1:
+        bound = _value(node.comparators[0])                # a length is never negative
+        if isinstance(bound, int) and not isinstance(bound, bool):
+            op = node.ops[0]
+            if (isinstance(op, ast.GtE) and bound <= 0) or (isinstance(op, ast.Gt) and bound < 0):
+                return True
+            if (isinstance(op, ast.Lt) and bound <= 0) or (isinstance(op, ast.LtE) and bound < 0):
+                return False
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and ast.dump(node.left) == ast.dump(node.comparators[0]) \
+            and not any(isinstance(sub, ast.Call) for sub in ast.walk(node)):
+        if isinstance(node.ops[0], (ast.Eq, ast.Is, ast.LtE, ast.GtE)):
+            return True
+        if isinstance(node.ops[0], (ast.NotEq, ast.IsNot, ast.Lt, ast.Gt)):
+            return False
+    return None
+
+
+def _decides(script: _Script, test: ast.expr) -> bool:
+    """A test the repository decides: it reads a repository name or a repository result, it is not about `__name__`
+    (the runner executes the script as __main__), and it does not come out the same whatever the call returned."""
+
+    if any(isinstance(sub, ast.Name) and sub.id == "__name__" for sub in ast.walk(test)):
+        return False
+    if not script.derived(test):
+        return False
+    try:
+        return _truth(test) is None
+    except (RecursionError, ValueError, OverflowError, MemoryError):
         return True
-    return isinstance(test, ast.Compare) and any(
-        isinstance(side, ast.Name) and side.id == "__name__" for side in (test.left, *test.comparators)
+
+
+def _try_calls_repository(script: _Script, node: ast.Try) -> bool:
+    """The body calls the repository, and the script does not raise anything of its own in it."""
+
+    return any(script.calls_repository(statement) for statement in node.body) and not any(
+        isinstance(sub, ast.Raise) for statement in node.body for sub in ast.walk(statement)
     )
 
 
-def _marker_is_conditional(tree: ast.AST) -> bool:
-    """True when a print call that names the marker sits in an `if` body or `else`, an `except`, or a `try`'s `else`
-    (the call raised nothing, which is the defect when it should have refused the input). A print after a call in the
-    body of a `try` with a handler says the same as that `else`: the call raising skips it."""
+def _marker_is_decided(script: _Script) -> bool:
+    """Every mention of the marker is a print that a repository result or exception decides.
 
+    A print counts when an enclosing `if` tests something the repository returned; or it is in an `except` or in the
+    `else` of a `try` whose body calls the repository and raises nothing itself; or it follows such a call in a `try`
+    body that has a handler (the call raising skips it). One honest print does not excuse another that always runs."""
+
+    tree = script.tree
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print"):
-            continue
-        if not any(
-            isinstance(part, ast.Constant) and isinstance(part.value, str) and MARKER in part.value
-            for arg in node.args
-            for part in ast.walk(arg)
-        ):
-            continue
-        child: ast.AST = node
-        parent = parents.get(node)
+    marked = [n for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and MARKER in n.value]
+    if not marked:
+        return False
+
+    def decided(call: ast.AST) -> bool:
+        child: ast.AST = call
+        parent = parents.get(call)
         while parent is not None:
-            if isinstance(parent, ast.If) and not _decides_nothing(parent.test):
+            if isinstance(parent, ast.If) and child is not parent.test and _decides(script, parent.test):
                 return True
             if isinstance(parent, ast.ExceptHandler):
-                return True
-            if isinstance(parent, (ast.Try, ast.TryStar)) and child in parent.orelse:
-                return True
-            if isinstance(parent, (ast.Try, ast.TryStar)) and parent.handlers and child in parent.body:
-                earlier = parent.body[: parent.body.index(child)]
-                if any(isinstance(part, ast.Call) for statement in earlier for part in ast.walk(statement)):
+                owner = parents.get(parent)
+                if isinstance(owner, (ast.Try, ast.TryStar)) and _try_calls_repository(script, owner):
                     return True
+            if isinstance(parent, (ast.Try, ast.TryStar)) and parent.handlers:
+                if child in parent.orelse and _try_calls_repository(script, parent):
+                    return True
+                if child in parent.body:
+                    earlier = parent.body[: parent.body.index(child)]
+                    if any(script.calls_repository(statement) for statement in earlier) and not any(
+                        isinstance(sub, ast.Raise) for statement in parent.body for sub in ast.walk(statement)
+                    ):
+                        return True
             child, parent = parent, parents.get(parent)
-    return False
+        return False
+
+    covered: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print":
+            inside = [c for arg in node.args for c in ast.walk(arg) if c in marked]
+            if inside and decided(node):
+                covered.update(id(c) for c in inside)
+    return all(id(c) in covered for c in marked)
 
 
 def ast_block_reason(source: str, packages: set[str]) -> str | None:
-    """Reject reproducers that do not call the repository, read its source, get around the trace, or print no marker
-    from a branch. Decided before anything runs."""
+    """Reject reproducers that do not call the repository, read its source, get around the trace, change the repository
+    or what it returned, or print no marker that a repository result decides. Decided before anything runs."""
 
     try:
         tree = ast.parse(source)
@@ -180,7 +525,7 @@ def ast_block_reason(source: str, packages: set[str]) -> str | None:
                 if root_name in packages:
                     has_import = True
                     module_aliases.add(alias.asname or root_name)
-                elif root_name in BLOCKED_MODULES:
+                elif root_name in BLOCKED_MODULES or tuple(alias.name.split(".")[:2]) in BLOCKED_ATTRS:
                     blocked = True
             self.generic_visit(node)
 
@@ -191,7 +536,8 @@ def ast_block_reason(source: str, packages: set[str]) -> str | None:
                 has_import = True
                 for alias in node.names:
                     func_aliases.add(alias.asname or alias.name)
-            elif root_name in BLOCKED_MODULES or any((root_name, alias.name) in BLOCKED_ATTRS for alias in node.names):
+            elif (root_name in BLOCKED_MODULES or tuple((node.module or "").split(".")[:2]) in BLOCKED_ATTRS
+                  or any((root_name, alias.name) in BLOCKED_ATTRS for alias in node.names)):
                 blocked = True
             self.generic_visit(node)
 
@@ -229,11 +575,65 @@ def ast_block_reason(source: str, packages: set[str]) -> str | None:
         return "reproducer uses a blocked module or attribute"
     if not has_import:
         return "reproducer does not import the repository"
+    script = _Script(tree, packages)
+    if script.changes_repository():
+        return CHANGES
     if not has_call:
         return "reproducer does not call the repository"
-    if not _marker_is_conditional(tree):
+    if not _marker_is_decided(script):
         return f"reproducer has no {MARKER} marker in a branch"
     return None
+
+
+@dataclass(frozen=True)
+class FuncDef:
+    """A function or method of the library: its file, its dotted name inside the file, and the lines its code object may
+    report as its first (the `def` line, or the first decorator)."""
+
+    file: str
+    parts: tuple[str, ...]
+    lines: tuple[int, ...]
+
+
+@functools.lru_cache(maxsize=16)
+def _function_index(root: str) -> tuple[FuncDef, ...]:
+    from alien_hunt.atoms import _py_files
+
+    found: list[FuncDef] = []
+    base = Path(root)
+    for path in _py_files(base):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError):
+            continue
+        relative = path.relative_to(base).as_posix()
+
+        def walk(node: ast.AST, prefix: tuple[str, ...]) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    parts = (*prefix, child.name)
+                    if not isinstance(child, ast.ClassDef):
+                        lines = {child.lineno, *(d.lineno for d in child.decorator_list)}
+                        found.append(FuncDef(relative, parts, tuple(sorted(lines))))
+                    walk(child, parts)
+                else:
+                    walk(child, prefix)
+
+        walk(tree, ())
+    return tuple(found)
+
+
+def function_index(root: Path) -> tuple[FuncDef, ...]:
+    return _function_index(str(root.resolve()))
+
+
+def _claim_parts(name: str) -> tuple[str, ...]:
+    """`pkg.mod.Class.fn`, `pkg/mod.py:fn`, `fn()` and `pkg.fn(0)` as their dotted parts: the file and the call are dropped."""
+
+    text = name.split("(")[0].strip()
+    if ":" in text:
+        text = text.rsplit(":", 1)[1]
+    return tuple(part for part in text.split(".") if part)
 
 
 def _function_tail(name: str) -> str:
@@ -242,9 +642,41 @@ def _function_tail(name: str) -> str:
     return re.split(r"[.:]", name.split("(")[0].strip())[-1]
 
 
-def interpret_run(claim: Claim, exit_code: int, calls: list[str], output: str, *, marker_seen: bool) -> Confirmation:
+def _entered(claim: Claim, defs: tuple[FuncDef, ...], sites: list, run_root: str) -> bool:
+    """A function the claim names ran, by file and line. `Class.fn` means that class's `fn`, not any `fn`; a name with no
+    definition of its own in the library (a method inherited from a base, say) is matched by its bare name."""
+
+    prefix = run_root.rstrip("/") + "/"
+    seen = {(str(file)[len(prefix):] if str(file).startswith(prefix) else str(file), line) for file, line in sites}
+    at = {(d.file, line): d for d in defs for line in d.lines}
+    ran = [at[site] for site in seen if site in at]
+    for name in claim.functions:
+        parts = _claim_parts(name)
+        if not parts:
+            continue
+        own = [d for d in defs if (k := min(len(parts), len(d.parts))) and parts[-k:] == d.parts[-k:]]
+        if own:
+            if any(d in ran for d in own):
+                return True
+        elif any(d.parts[-1] == parts[-1] for d in ran):
+            return True
+    return False
+
+
+def interpret_run(
+    claim: Claim,
+    exit_code: int,
+    calls: list[str],
+    output: str,
+    *,
+    marker_seen: bool,
+    sites: list | None = None,
+    defs: tuple[FuncDef, ...] | None = None,
+    run_root: str = "",
+) -> Confirmation:
     """A claim is confirmed only when a function it names was entered, the marker was printed, and the script exited 0.
-    `marker_seen` comes from the whole of stdout: `output` is only its tail."""
+    `marker_seen` comes from the whole of stdout: `output` is only its tail. With `sites` (the file and first line of each
+    library function the trace entered) and `defs`, "entered" means that very function; without them, the same bare name."""
 
     called = {item.split(":")[-1] for item in calls}
     expected = {tail for tail in map(_function_tail, claim.functions) if tail}
@@ -254,14 +686,28 @@ def interpret_run(claim: Claim, exit_code: int, calls: list[str], output: str, *
         return Confirmation(False, "exit status was not 0", exit_code, output, calls)
     if not calls:
         return Confirmation(False, "script did not call repository code", exit_code, output, calls)
-    if called.isdisjoint(expected):
+    if sites is not None and defs is not None:
+        entered = _entered(claim, defs, sites, run_root)
+    else:
+        entered = not called.isdisjoint(expected)
+    if not entered:
         return Confirmation(False, "named function was not called", exit_code, output, calls)
     if not marker_seen:
         return Confirmation(False, f"{MARKER} was not printed", exit_code, output, calls)
     return Confirmation(True, "a named function ran, the marker was printed, and the script exited 0", exit_code, output, calls)
 
 
-def _run_runner(
+def _read_sites(path: Path) -> list | None:
+    """The (file, first line) pairs the runner wrote, or None when it wrote none: then the bare names decide."""
+
+    try:
+        sites = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return [site for site in sites if isinstance(site, list) and len(site) == 2] if isinstance(sites, list) else None
+
+
+def _run_with_sites(
     checkout: Path,
     reproducer: str,
     work: Path,
@@ -270,8 +716,9 @@ def _run_runner(
     extra_env: dict[str, str] | None = None,
     argv_prefix: list[str] | None = None,
     timeout: int = 60,
-) -> tuple[int, list[str], str, bool]:
-    """Returns the exit code, the traced calls, the output's tail, and whether stdout had the marker."""
+) -> tuple[int, list[str], str, bool, list]:
+    """Returns the exit code, the traced calls, the output's tail, whether stdout had the marker, and the file and first
+    line of each library function entered."""
 
     work.mkdir(parents=True, exist_ok=True)
     repro_path = work / "repro.py"
@@ -304,13 +751,19 @@ def _run_runner(
         calls = []
     if not isinstance(calls, list):
         calls = []
-    return completed.returncode, [str(item) for item in calls], output, marker_seen
+    return completed.returncode, [str(item) for item in calls], output, marker_seen, _read_sites(work / "calls.sites.json")
 
 
 def os_path() -> str:
     import os
 
     return os.environ.get("PATH", "")
+
+
+def _run_runner(checkout: Path, reproducer: str, work: Path, **kwargs) -> tuple[int, list[str], str, bool]:
+    """Returns the exit code, the traced calls, the output's tail, and whether stdout had the marker."""
+
+    return _run_with_sites(checkout, reproducer, work, **kwargs)[:4]
 
 
 def confirm_local(claim: Claim, checkout: Path, work: Path, *, python: str | None = None) -> Confirmation:
@@ -323,7 +776,7 @@ def confirm_local(claim: Claim, checkout: Path, work: Path, *, python: str | Non
     import sys
 
     try:
-        code, calls, output, marker_seen = _run_runner(
+        code, calls, output, marker_seen, sites = _run_with_sites(
             checkout,
             claim.reproducer,
             work,
@@ -331,7 +784,10 @@ def confirm_local(claim: Claim, checkout: Path, work: Path, *, python: str | Non
         )
     except subprocess.TimeoutExpired:
         return Confirmation(False, "timed out")
-    return interpret_run(claim, code, calls, output, marker_seen=marker_seen)
+    return interpret_run(
+        claim, code, calls, output, marker_seen=marker_seen, sites=sites, defs=function_index(checkout),
+        run_root=os.path.realpath(checkout),
+    )
 
 
 def python_tag_for(image: str) -> str:
@@ -854,7 +1310,10 @@ def confirm_podman(
         calls = []
     if not isinstance(calls, list):
         calls = []
-    confirmation = interpret_run(claim, completed.returncode, [str(item) for item in calls], output, marker_seen=marker_seen)
+    confirmation = interpret_run(
+        claim, completed.returncode, [str(item) for item in calls], output, marker_seen=marker_seen,
+        sites=_read_sites(result / "calls.sites.json"), defs=function_index(checkout), run_root="/src",
+    )
     if not confirmation.confirmed:
         confirmation.why += note
     return confirmation
