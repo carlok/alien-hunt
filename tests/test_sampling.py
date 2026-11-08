@@ -37,8 +37,66 @@ def test_pairs_live_together_same_file_first():
     assert ids[:2] == [("s1", "k1"), ("s2", "k2")]          # the same file first
     assert set(ids[2:]) == {("s1", "k2"), ("s2", "k1")}     # then the same top folder
     assert all(o.id != "k3" and s.id != "s3" for s, o in pairs)   # never across unrelated folders
-    assert colocated_pairs(sources, others, limit=1, seed=1) == pairs[:1]
+    cut = [(s.id, o.id) for s, o in colocated_pairs(sources, others, limit=2, seed=1)]
+    assert set(cut) == set(ids[:2])                                             # a cut pool still starts in the files
+    assert [(s.id, o.id) for s, o in colocated_pairs(sources, others, limit=1, seed=1)][0] in ids[:2]
     assert colocated_pairs(sources, others, limit=3, seed=7) == colocated_pairs(sources, others, limit=3, seed=7)
+
+
+def placed(kind: str, ident: str, file: str, scope: str | None) -> Atom:
+    return Atom(kind=kind, id=ident, text=f"{kind} {ident}", file=file, scope=scope)
+
+
+def test_a_pool_that_fits_comes_back_whole_in_construction_order():
+    sources = [placed("source", "s1", "dir_a/file_a.py", "fn_a"), placed("source", "s2", "dir_a/file_b.py", "fn_b")]
+    others = [placed("sink", "k1", "dir_a/file_a.py", "fn_a"), placed("sink", "k2", "dir_a/file_a.py", "fn_c"), placed("sink", "k3", "dir_a/file_b.py", "fn_b")]
+    pairs = [(s.id, o.id) for s, o in colocated_pairs(sources, others, limit=10, seed=3)]
+    assert pairs == [("s1", "k1"), ("s1", "k2"), ("s2", "k3"), ("s1", "k3"), ("s2", "k1"), ("s2", "k2")]   # files, then the folder
+
+
+def test_a_cut_pool_takes_the_same_function_before_the_same_file_before_the_folder():
+    sources = [placed("source", "s1", "dir_a/file_a.py", "fn_a"), placed("source", "s2", "dir_a/file_b.py", "fn_b")]
+    others = [placed("sink", "k1", "dir_a/file_a.py", "fn_a"), placed("sink", "k2", "dir_a/file_a.py", "fn_c"), placed("sink", "k3", "dir_a/file_b.py", "fn_b")]
+    for seed in range(5):
+        pairs = [(s.id, o.id) for s, o in colocated_pairs(sources, others, limit=3, seed=seed)]
+        assert set(pairs[:2]) == {("s1", "k1"), ("s2", "k3")}      # the pairs inside one function
+        assert pairs[2] == ("s1", "k2")                             # then the one left in a file
+
+
+def test_the_draw_reaches_distinct_functions_before_a_second_pair_in_one():
+    sources = [placed("source", f"s{n}", "dir_a/file_a.py", f"fn_p{n}") for n in range(8)]
+    others = [placed("sink", f"k{n}", "dir_a/file_a.py", f"fn_p{n}") for n in range(8)]
+    for seed in range(5):
+        pairs = colocated_pairs(sources, others, limit=8, seed=seed)         # 8 own-function pairs among 64 in the file
+        assert sorted(s.scope for s, _ in pairs) == sorted(f"fn_p{n}" for n in range(8))
+        assert all(s.scope == o.scope for s, o in pairs)                     # the plausible path is taken first
+
+
+def test_the_draw_does_not_spend_two_slots_on_one_atom_while_others_wait():
+    sources = [placed("source", f"s{n}", "dir_a/file_a.py", f"fn_p{n}") for n in range(6)]
+    others = [placed("sink", f"k{n}", "dir_a/file_a.py", f"fn_q{n}") for n in range(6)]
+    for seed in range(5):
+        pairs = colocated_pairs(sources, others, limit=6, seed=seed)         # 36 pairs, none inside one function
+        assert len({s.id for s, _ in pairs}) == 6 and len({o.id for _, o in pairs}) == 6
+        assert len({s.scope for s, _ in pairs} | {o.scope for _, o in pairs}) == 12
+
+
+def test_among_functions_that_are_new_the_ones_holding_more_atoms_come_first():
+    sources = [placed("source", "q", "dir_a/file_a.py", "fn_calm"), *(placed("source", f"b{n}", "dir_a/file_a.py", "fn_busy") for n in range(3))]
+    others = [placed("sink", "k", "dir_a/file_a.py", "fn_lone")]
+    for seed in range(8):
+        (pair,) = colocated_pairs(sources, others, limit=1, seed=seed)
+        assert pair[0].scope == "fn_busy"
+        both = colocated_pairs(sources, others, limit=2, seed=seed)
+        assert [s.scope for s, _ in both] == ["fn_busy", "fn_calm"]      # a second pair in the same function waits
+
+
+def test_the_draw_fills_the_limit_when_new_functions_run_out():
+    sources = [placed("source", f"s{n}", "dir_a/file_a.py", "fn_lone") for n in range(3)]
+    others = [placed("sink", f"k{n}", "dir_a/file_a.py", "fn_lone") for n in range(3)]
+    pairs = colocated_pairs(sources, others, limit=5, seed=4)
+    assert len(pairs) == len(set((s.id, o.id) for s, o in pairs)) == 5
+    assert colocated_pairs(sources, others, limit=5, seed=4) == pairs              # the same seed draws the same pairs
 
 
 MECHS = [Atom(kind="mechanism", id=f"m{n:02d}", text=f"mechanism {n}") for n in range(10)]

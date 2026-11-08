@@ -22,7 +22,25 @@ Candidates are built from atoms of the library itself (not its tests, docs or ex
 - how many functions both sides' confirmed claims share (their names stay in `out/<run>/local/detail.json`)
 - how many of the top candidates the directed hunt judged incoherent, and that fraction among the ones rated 4 or 5
 
-A claim counts only when its reproducer imports the repository, enters a function the claim names, prints `DEFECT-OBSERVED` from an `if` or `except` branch (or the `else` of a `try`, or after the call in a `try` with an `except`), and exits 0. A script that only calls something and exits 0 does not count: on one run that older check confirmed 7 claims that were 3 trivial behaviours. A script that reads source text does not count either, nor one that uses what reads it or gets around the trace (`inspect`, `ast`, `sys.settrace`, `os._exit` and a few more). This shows that the script tested something and that the test came out; it is no proof of a defect. A broad `except` around a call that raises still passes, and the script shares its process with the trace.
+A claim counts only when its reproducer imports the repository, enters a function the claim names, prints `DEFECT-OBSERVED` from a branch that a repository result or exception decides, and exits 0. A script that only calls something and exits 0 does not count: on one run that older check confirmed 7 claims that were 3 trivial behaviours. A script that reads source text does not count either, nor one that uses what reads it or gets around the trace (`inspect`, `ast`, `mock`, `sys.settrace`, `os._exit` and a few more).
+
+What "decides" means, checked on the script's syntax tree before anything runs:
+
+- The branch is an `if` whose test reads a repository name or something a repository call returned (a name assigned only from such values, or a list the script starts empty and feeds only with them, or a helper the script defines that calls the repository); or an `except`, or the `else` of a `try`, whose body calls the repository and raises nothing itself; or a print after such a call in a `try` body that has a handler.
+- The test must not come out the same whatever the call returned: a constant, `x or True`, `x == x`, `len(x) >= 0`, `__name__`.
+- Every mention of the marker must be such a print. One honest print does not excuse a second that always runs.
+- The script may not patch, shadow or subclass the repository, call `setattr` on it, or edit a value a repository call returned. A test of code the script replaced tests the script.
+
+The trace, which runs in the container, counts a function as entered by file and line, not by name. `Class.fn` means that class's `fn`, and a name with no definition of its own (a method inherited from a base) is matched by its bare name. Functions that run while an import is in progress do not count, nor does code the script compiles under a library path, nor a function outside the library files (tests, docs). Calls from threads are traced.
+
+This shows that the script tested something the repository did, and that the test came out; it is no proof of a defect. What the check does not stop, found by reading it from outside (`reports/offline-tune/SUMMARY.md` has the scripts):
+
+- **A test that comes out true for correct behaviour.** An inverted comparison (`len(got) == 3` printed when the call is right), `is not None`, `type(got) is list`, `isinstance`. Telling these from a real defect takes a differential run: the same script must stay silent against a fixed version.
+- **A correct rejection reported as a defect.** `try: f(None)` with `except TypeError: print(...)`, a broad `except Exception`, and a print after a call that did not raise have the same shape as the claims worth making: that the call should have raised, or crashed on valid input.
+- **Arguments that test nothing.** A default or stub argument whose output is then compared with a literal.
+- **A claim that names several functions counts when any one ran,** and an inherited method is matched by its bare name, so a base-class constructor run by another class counts.
+- **A marker built from pieces,** printed beside an honest print that never runs.
+- **The script shares its process with the trace.** The blocked modules and attributes stop the obvious routes to forging it; a script written to fool the trace could still. That route was not tested in the offline round that tightened the check.
 
 Confirmation runs in Podman with `--network none`, the checkout mounted read-only, and third-party dependencies installed from wheels uploaded on or before the commit: the declared ones, the packages the reproducers import, and their own dependencies (read from each wheel's METADATA). A package with no such wheel, or whose wheel does not match the index's sha256, is named in the log and left out. If the install fails, the reproducers run without any wheels, and a refusal says why. Nothing is built from source.
 

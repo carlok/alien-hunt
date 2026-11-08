@@ -108,27 +108,86 @@ def _top_dir(path: str | None) -> str:
     return parts[0] if len(parts) > 1 else "."
 
 
+def _closeness(source: Atom, other: Atom) -> int | None:
+    """0 when both atoms sit in one function, 1 in one file, 2 in one top-level folder, None when apart."""
+
+    if not source.file or not other.file:
+        return None
+    if source.file == other.file:
+        return 0 if source.scope is not None and source.scope == other.scope else 1
+    return 2 if _top_dir(source.file) == _top_dir(other.file) else None
+
+
+def _place(atom: Atom) -> tuple[str | None, str | None]:
+    return atom.file, atom.scope
+
+
 def colocated_pairs(sources: list[Atom], others: list[Atom], *, limit: int, seed: int) -> list[tuple[Atom, Atom]]:
-    """(source, sink-or-invariant) pairs that live together: the same file first, then the same top-level folder.
+    """(source, sink-or-invariant) pairs that live together: the same function, the same file, or the same top-level
+    folder. At most `limit` pairs, drawn with `seed`; a pool that fits in `limit` is returned whole, the same file
+    before the same folder, in construction order.
 
     Uniform triples were almost never coherent on PyJWT (74 of 80 rated 1): a source and a sink from two unrelated
-    files rarely meet on a real path. At most `limit` pairs; a larger group is sampled with `seed`."""
+    files rarely meet on a real path. The pairs of a file are the product of its sources and its sinks, so a uniform
+    draw spends its few slots on the biggest files and on a handful of functions. This one walks the pairs closest
+    first (one function, then one file, then one folder; inside each, the functions holding the most atoms first, ties
+    shuffled with `seed`) and keeps, in turn: those whose two functions no kept pair has used, those with one new
+    function, those with two atoms not used yet, those with one, then whatever is left. The draw reaches as many
+    functions as it can."""
 
-    same_file = [(s, o) for s in sources for o in others if s.file and s.file == o.file]
-    same_dir = [
-        (s, o)
-        for s in sources
-        for o in others
-        if s.file and o.file and s.file != o.file and _top_dir(s.file) == _top_dir(o.file)
-    ]
+    same_file: list[tuple[Atom, Atom]] = []
+    same_folder: list[tuple[Atom, Atom]] = []
+    for source in sources:
+        for other in others:
+            close = _closeness(source, other)
+            if close is not None:
+                (same_folder if close == 2 else same_file).append((source, other))
+    if len(same_file) + len(same_folder) <= limit:
+        return same_file + same_folder
     rng = random.Random(seed)
+    rng.shuffle(same_file)
+    rng.shuffle(same_folder)
+    busy: dict[tuple[str | None, str | None], int] = {}
+    for atom in (*sources, *others):
+        if atom.file:
+            busy[_place(atom)] = busy.get(_place(atom), 0) + 1
+
+    def crowd(pair: tuple[Atom, Atom]) -> int:
+        return -(busy[_place(pair[0])] + busy[_place(pair[1])])
+
+    # Stable sorts: the shuffle breaks ties. Closest first, then the functions holding more atoms.
+    order = sorted(same_file, key=lambda pair: (_closeness(*pair), crowd(pair))) + sorted(same_folder, key=crowd)
+    places: set[tuple[str | None, str | None]] = set()
+    used: set[str] = set()
+    taken = [False] * len(order)
     picked: list[tuple[Atom, Atom]] = []
-    for group in (same_file, same_dir):
-        need = limit - len(picked)
-        if need <= 0:
-            break
-        picked.extend(group if len(group) <= need else rng.sample(group, need))
+    wants = (
+        lambda s, o: _place(s) not in places and _place(o) not in places,
+        lambda s, o: _place(s) not in places or _place(o) not in places,
+        lambda s, o: s.id not in used and o.id not in used,
+        lambda s, o: s.id not in used or o.id not in used,
+        lambda s, o: True,
+    )
+    for want in wants:
+        for index, (source, other) in enumerate(order):
+            if len(picked) >= limit:
+                return picked
+            if not taken[index] and want(source, other):
+                taken[index] = True
+                picked.append((source, other))
+                places.update((_place(source), _place(other)))
+                used.update((source.id, other.id))
     return picked
+
+
+def pool_pairs(
+    sources: list[Atom], sinks: list[Atom], invariants: list[Atom], *, sample_limit: int, seed: int
+) -> list[tuple[Atom, Atom]]:
+    """The pairs a run's candidate pool is built from: each source against the sinks and the invariants, a quarter of
+    `sample_limit` of them (the model then proposes up to four mechanisms per pair). The pipeline and
+    scripts/pool_ceiling.py both call this, so a measurement of the pool uses the pool's own rule."""
+
+    return colocated_pairs(sources, [*sinks, *invariants], limit=max(1, sample_limit // 4), seed=seed)
 
 
 def coherence_miss_rate(top: list[Candidate]) -> float | None:
