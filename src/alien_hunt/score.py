@@ -131,6 +131,16 @@ def colocated_pairs(sources: list[Atom], others: list[Atom], *, limit: int, seed
     return picked
 
 
+def pool_pairs(
+    sources: list[Atom], sinks: list[Atom], invariants: list[Atom], *, sample_limit: int, seed: int
+) -> list[tuple[Atom, Atom]]:
+    """The pairs a run's candidate pool is built from: each source against the sinks and the invariants, a quarter of
+    `sample_limit` of them (the model then proposes up to four mechanisms per pair). The pipeline and
+    scripts/pool_ceiling.py both call this, so a measurement of the pool uses the pool's own rule."""
+
+    return colocated_pairs(sources, [*sinks, *invariants], limit=max(1, sample_limit // 4), seed=seed)
+
+
 def coherence_miss_rate(top: list[Candidate]) -> float | None:
     """Fraction of hunted candidates rated 4 or 5 that the hunt judged incoherent."""
 

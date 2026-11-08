@@ -28,7 +28,7 @@ from alien_hunt.hunt import directed_hunt
 from alien_hunt.llm import LLMError
 from alien_hunt.redact import redact
 from alien_hunt.report import overlap_functions, public_rows, render_report, unique_confirmed
-from alien_hunt.score import apply_scores, colocated_pairs, unavailability
+from alien_hunt.score import apply_scores, pool_pairs, unavailability
 from alien_hunt.types import Atom, Candidate, Claim, Confirmation, KnownAdvisory
 
 log = logging.getLogger("alien_hunt")
@@ -363,8 +363,7 @@ def _stages(
         _log_claims(local, claims)
     state.habit_strings = habit_texts(state.claims, checkout, scanners=scanners)
     habit_vectors = _embed_habits(paid, state.habit_strings)
-    others = [*state.sinks, *state.invariants]
-    pairs = colocated_pairs(state.sources, others, limit=max(1, sample_limit // 4), seed=seed)
+    pairs = pool_pairs(state.sources, state.sinks, state.invariants, sample_limit=sample_limit, seed=seed)
     state.candidates = propose_candidates(paid, pairs, state.mechanisms, seed=seed, max_output=max_output)[:sample_limit]
     rate_coherence(paid, checkout, state.candidates, batch_size=coherence_batch, max_output=max_output)
     state.ranked_07, state.ranked_04 = _score_pool(paid, state.candidates, habit_vectors)
