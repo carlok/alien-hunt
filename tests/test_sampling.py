@@ -81,6 +81,16 @@ def test_the_draw_does_not_spend_two_slots_on_one_atom_while_others_wait():
         assert len({s.scope for s, _ in pairs} | {o.scope for _, o in pairs}) == 12
 
 
+def test_among_functions_that_are_new_the_ones_holding_more_atoms_come_first():
+    sources = [placed("source", "q", "dir_a/file_a.py", "fn_calm"), *(placed("source", f"b{n}", "dir_a/file_a.py", "fn_busy") for n in range(3))]
+    others = [placed("sink", "k", "dir_a/file_a.py", "fn_lone")]
+    for seed in range(8):
+        (pair,) = colocated_pairs(sources, others, limit=1, seed=seed)
+        assert pair[0].scope == "fn_busy"
+        both = colocated_pairs(sources, others, limit=2, seed=seed)
+        assert [s.scope for s, _ in both] == ["fn_busy", "fn_calm"]      # a second pair in the same function waits
+
+
 def test_the_draw_fills_the_limit_when_new_functions_run_out():
     sources = [placed("source", f"s{n}", "dir_a/file_a.py", "fn_lone") for n in range(3)]
     others = [placed("sink", f"k{n}", "dir_a/file_a.py", "fn_lone") for n in range(3)]

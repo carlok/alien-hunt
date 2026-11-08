@@ -130,9 +130,10 @@ def colocated_pairs(sources: list[Atom], others: list[Atom], *, limit: int, seed
     Uniform triples were almost never coherent on PyJWT (74 of 80 rated 1): a source and a sink from two unrelated
     files rarely meet on a real path. The pairs of a file are the product of its sources and its sinks, so a uniform
     draw spends its few slots on the biggest files and on a handful of functions. This one walks the pairs closest
-    first (one function, then one file, then one folder, each shuffled with `seed`) and keeps, in turn: those whose
-    two functions no kept pair has used, those with one new function, those with two atoms not used yet, those with
-    one, then whatever is left. The draw reaches as many functions as it can."""
+    first (one function, then one file, then one folder; inside each, the functions holding the most atoms first, ties
+    shuffled with `seed`) and keeps, in turn: those whose two functions no kept pair has used, those with one new
+    function, those with two atoms not used yet, those with one, then whatever is left. The draw reaches as many
+    functions as it can."""
 
     same_file: list[tuple[Atom, Atom]] = []
     same_folder: list[tuple[Atom, Atom]] = []
@@ -146,7 +147,16 @@ def colocated_pairs(sources: list[Atom], others: list[Atom], *, limit: int, seed
     rng = random.Random(seed)
     rng.shuffle(same_file)
     rng.shuffle(same_folder)
-    order = sorted(same_file, key=lambda pair: _closeness(*pair)) + same_folder      # a stable sort: one function first
+    busy: dict[tuple[str | None, str | None], int] = {}
+    for atom in (*sources, *others):
+        if atom.file:
+            busy[_place(atom)] = busy.get(_place(atom), 0) + 1
+
+    def crowd(pair: tuple[Atom, Atom]) -> int:
+        return -(busy[_place(pair[0])] + busy[_place(pair[1])])
+
+    # Stable sorts: the shuffle breaks ties. Closest first, then the functions holding more atoms.
+    order = sorted(same_file, key=lambda pair: (_closeness(*pair), crowd(pair))) + sorted(same_folder, key=crowd)
     places: set[tuple[str | None, str | None]] = set()
     used: set[str] = set()
     taken = [False] * len(order)
