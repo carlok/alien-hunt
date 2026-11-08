@@ -71,6 +71,7 @@ class Atom:
     file: str | None = None
     function: str | None = None
     line: int | None = None
+    scope: str | None = None  # the function the atom sits in (dotted through its classes); None at module level
 
     def as_dict(self) -> dict:
         return asdict(self)

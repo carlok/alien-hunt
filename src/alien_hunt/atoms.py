@@ -144,6 +144,35 @@ def _input_sinks(func: ast.AST, relative: str) -> list[Atom]:
     return out
 
 
+def _function_spans(tree: ast.AST) -> list[tuple[int, int, str]]:
+    """(first line, last line, dotted name) of every function in a file, the names running through the classes and
+    functions around it."""
+
+    spans: list[tuple[int, int, str]] = []
+
+    def walk(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{prefix}{child.name}"
+                if not isinstance(child, ast.ClassDef):
+                    spans.append((child.lineno, getattr(child, "end_lineno", None) or child.lineno, name))
+                walk(child, f"{name}.")
+            else:
+                walk(child, prefix)
+
+    walk(tree, "")
+    return spans
+
+
+def _scope_at(spans: list[tuple[int, int, str]], line: int | None) -> str | None:
+    """The innermost function holding a line, or None for module-level code."""
+
+    if line is None:
+        return None
+    inside = [span for span in spans if span[0] <= line <= span[1]]
+    return min(inside, key=lambda span: span[1] - span[0])[2] if inside else None
+
+
 def _spread(items: list[Atom], limit: int) -> list[Atom]:
     if len(items) <= limit:
         return items
@@ -162,11 +191,13 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
     sinks: list[Atom] = []
     invariants: list[Atom] = []
     seen: set[str] = set()
+    spans: list[tuple[int, int, str]] = []          # the functions of the file being read
 
     def add(bucket: list[Atom], atom: Atom) -> None:
         if atom.id in seen:
             return
         seen.add(atom.id)
+        atom.scope = _scope_at(spans, atom.line)
         bucket.append(atom)
 
     for path in _py_files(root):
@@ -175,6 +206,7 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
             tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
         except SyntaxError:
             continue
+        spans[:] = _function_spans(tree)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for atom in _input_sinks(node, relative):
