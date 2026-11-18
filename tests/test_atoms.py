@@ -119,22 +119,19 @@ def test_atoms_record_the_function_they_sit_in(tmp_path: Path):
 
 
 _KINDS = (
+    "def plain_kinds_zq(first, second):\n    return first\n\n"
     "def pos_zq(first, /):\n    return first\n\n"
     "def kw_zq(*, key):\n    return key\n\n"
     "def var_zq(*parts):\n    return parts\n\n"
-    "def kws_zq(**options):\n    return options\n\n"
-    "def none_zq():\n    return 1\n"
+    "def kws_zq(**options):\n    return options\n"
 )
 
 
-def test_every_kind_of_parameter_is_a_source(tmp_path: Path):
+def test_sources_come_from_ordinary_parameters_only(tmp_path: Path):
+    """Measured for 0.2.0 (CHANGELOG.md): sources from the other kinds crowded lighter functions out of the capped pool."""
+
     sources, _, _, _ = extract_atoms(_library(tmp_path, {"pkg/kinds_zq.py": _KINDS}))
-    assert sorted(atom.text for atom in sources) == [
-        "caller argument **options of kws_zq",
-        "caller argument *parts of var_zq",
-        "caller argument first of pos_zq",
-        "caller argument key of kw_zq",
-    ]
+    assert [atom.text for atom in sources] == ["caller argument first of plain_kinds_zq"]
 
 
 _RECEIVERS = (
@@ -186,10 +183,10 @@ _LOOPS = (
 )
 
 
-def test_loops_over_keyword_only_and_star_parameters_are_sinks_and_a_shared_loop_is_one(tmp_path: Path):
+def test_a_loop_over_a_keyword_only_parameter_is_a_sink_and_a_shared_loop_is_one(tmp_path: Path):
     _, sinks, _, _ = extract_atoms(_library(tmp_path, {"pkg/loops_zq.py": _LOOPS}))
     loops = sorted(atom.text for atom in sinks if atom.text.startswith("loop over"))
     assert "loop over caller-supplied items in walk_zq" in loops
-    assert "loop over caller-supplied parts in join_zq" in loops
+    assert not any("join_zq" in text for text in loops)          # *parts is not read, like a source
     shared = [atom for atom in sinks if atom.line == 10]
     assert len(shared) == 1 and shared[0].scope == "outer_zq.inner_zq"

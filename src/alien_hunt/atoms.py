@@ -127,22 +127,21 @@ def _methods(tree: ast.AST) -> set[int]:
     }
 
 
-def _parameters(func: ast.AST, *, method: bool) -> list[tuple[str, str]]:
-    """(name, how a caller passes it) for every parameter, in signature order: positional-only, ordinary, `*args`,
-    keyword-only, `**kwargs`. A method's receiver is not caller input, so its first positional parameter is left out
-    unless it is a staticmethod; elsewhere a first parameter named `self` or `cls` is left out too (a function written to
-    be bound later)."""
+def _parameters(func: ast.AST, *, method: bool) -> tuple[list[str], list[str]]:
+    """The ordinary and the keyword-only parameter names, in signature order. A method's receiver is not caller input,
+    so its first positional parameter is left out unless it is a staticmethod; elsewhere a first parameter named `self`
+    or `cls` is left out too (a function written to be bound later).
+
+    Sources come from the ordinary parameters only; the loop and decode sinks also read keyword-only ones. Reading
+    positional-only, keyword-only, `*args` and `**kwargs` parameters as sources too was measured for 0.2.0: under the
+    fixed caps the new sources pushed lighter functions' sources out, and the share of draws reaching the fixed code
+    fell on held-out advisories (CHANGELOG.md)."""
 
     positional = [*func.args.posonlyargs, *func.args.args]
     if positional and ((method and not _is_static(func)) or (not method and positional[0].arg in {"self", "cls"})):
         positional = positional[1:]
-    out = [(arg.arg, arg.arg) for arg in positional]
-    if func.args.vararg is not None:
-        out.append((func.args.vararg.arg, f"*{func.args.vararg.arg}"))
-    out.extend((arg.arg, arg.arg) for arg in func.args.kwonlyargs)
-    if func.args.kwarg is not None:
-        out.append((func.args.kwarg.arg, f"**{func.args.kwarg.arg}"))
-    return out
+    ordinary = {arg.arg for arg in func.args.args}
+    return [arg.arg for arg in positional if arg.arg in ordinary], [arg.arg for arg in func.args.kwonlyargs]
 
 
 def _input_sinks(func: ast.AST, relative: str, params: set[str]) -> list[Atom]:
@@ -290,17 +289,17 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
         methods = _methods(tree)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                params = _parameters(node, method=id(node) in methods)
+                ordinary, keyword = _parameters(node, method=id(node) in methods)
                 scope = _scope_at(spans, node.lineno) or node.name       # ids by the dotted name: A.f and B.f both stay
-                for atom in _input_sinks(node, relative, {name for name, _ in params}):
+                for atom in _input_sinks(node, relative, {*ordinary, *keyword}):
                     add(sinks, atom)
-                for name, passed in params:
+                for name in ordinary:
                     add(
                         sources,
                         Atom(
                             kind="source",
                             id=f"src-{relative}-{scope}-{name}",
-                            text=f"caller argument {passed} of {node.name}",
+                            text=f"caller argument {name} of {node.name}",
                             file=relative,
                             function=node.name,
                             line=node.lineno,
