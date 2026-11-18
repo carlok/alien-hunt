@@ -123,6 +123,12 @@ def _arms(args: argparse.Namespace) -> int:
     return 0
 
 
+def _short(path: Path) -> str:
+    """A checkout's label in a table: its last two folders, not a path that runs off the line."""
+
+    return "/".join(path.resolve().parts[-2:])
+
+
 def _config_image(path: Path) -> str | None:
     if not path.is_file():
         return None
@@ -147,7 +153,7 @@ def _replay(args: argparse.Namespace) -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if args.local:
         path = prepare_local(args.local)
-        here = Tree(path, _commit_time(path), (args.commit or str(path))[:40])
+        here = Tree(path, _commit_time(path), args.commit[:12] if args.commit else _short(path))
     elif url:
         parse_github_url(url)
         commit = args.commit or str(record.get("commit") or "")
@@ -167,7 +173,7 @@ def _replay(args: argparse.Namespace) -> int:
         there = Tree(path, _commit_time(path), sha[:12])
     elif args.against_local:
         path = prepare_local(args.against_local)
-        there = Tree(path, _commit_time(path), str(path)[:40])
+        there = Tree(path, _commit_time(path), _short(path))
     image = args.image or record.get("container_image") or _config_image(args.config) or DEFAULT_IMAGE
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     local = args.run / "local"
