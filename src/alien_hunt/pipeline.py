@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from alien_hunt import __version__
 from alien_hunt.agent import PaidModel, read_file, resolve_inside
 from alien_hunt.arms import ARMS_FILE, arm_summary, hunt_order, render_table, select_arms, write_label_sheet
 from alien_hunt.atoms import extract_atoms, filter_invariants
@@ -33,6 +34,7 @@ from alien_hunt.types import Atom, Candidate, Claim, Confirmation, KnownAdvisory
 
 log = logging.getLogger("alien_hunt")
 
+RUN_FILE = "run.json"                 # what a run ran on: version, target, full commit, image (read back by `replay`)
 _PLAIN_SYSTEM_NOTE = "STAGE: invariants"
 _PLAIN_PASSES = 3
 _MAX_CONSECUTIVE_FAILURES = 3
@@ -444,6 +446,20 @@ def execute(
     out_dir.mkdir(parents=True, exist_ok=True)
     local = out_dir / "local"
     local.mkdir(exist_ok=True)
+    dump_json(                                  # first, so a run killed outright still says what it ran on
+        out_dir / RUN_FILE,
+        {
+            "alien_hunt": __version__,
+            "run_id": run_id,
+            "target": target,
+            "commit": commit,
+            "confirm_mode": confirm_mode,
+            "container_image": container_image,
+            "seed": seed,
+            "sample_limit": sample_limit,
+            "arms": arms,
+        },
+    )
     paid = PaidModel(model, budget, prices)
     state = RunState()
     when = commit_time or datetime.now(timezone.utc)

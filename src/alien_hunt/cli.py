@@ -9,6 +9,7 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
+from alien_hunt import __version__
 from alien_hunt.arms import load_labels, load_run, render_totals
 from alien_hunt.budget import Budget
 from alien_hunt.checkout import (
@@ -57,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="alien-hunt",
         description="Look for defects a plain review of a repository does not already produce.",
     )
+    parser.add_argument("--version", action="version", version=f"alien-hunt {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="review one public GitHub commit")
     run.add_argument("url", nargs="?", help="https://github.com/owner/repo")
