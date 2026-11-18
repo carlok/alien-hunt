@@ -107,12 +107,52 @@ def _rooted_in(node: ast.AST, params: set[str]) -> bool:
             return False
 
 
-def _input_sinks(func: ast.AST, relative: str) -> list[Atom]:
+def _is_static(func: ast.AST) -> bool:
+    return any(
+        (isinstance(item, ast.Name) and item.id == "staticmethod")
+        or (isinstance(item, ast.Attribute) and item.attr == "staticmethod")
+        for item in func.decorator_list
+    )
+
+
+def _methods(tree: ast.AST) -> set[int]:
+    """The functions defined directly in a class body (by `id`), whose first parameter is the receiver."""
+
+    return {
+        id(child)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        for child in node.body
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _parameters(func: ast.AST, *, method: bool) -> tuple[list[str], list[str]]:
+    """The ordinary and the keyword-only parameter names, in signature order. A method's receiver is not caller input,
+    so its first positional parameter is left out unless it is a staticmethod; elsewhere a first parameter named `self`
+    or `cls` is left out too (a function written to be bound later).
+
+    Sources come from the ordinary parameters only; the loop and decode sinks also read keyword-only ones. Reading
+    positional-only, keyword-only, `*args` and `**kwargs` parameters as sources too was measured for 0.2.0: under the
+    fixed caps the new sources pushed lighter functions' sources out, and the share of draws reaching the fixed code
+    fell on held-out advisories (CHANGELOG.md)."""
+
+    positional = [*func.args.posonlyargs, *func.args.args]
+    if positional and ((method and not _is_static(func)) or (not method and positional[0].arg in {"self", "cls"})):
+        positional = positional[1:]
+    ordinary = {arg.arg for arg in func.args.args}
+    return [arg.arg for arg in positional if arg.arg in ordinary], [arg.arg for arg in func.args.kwonlyargs]
+
+
+def _input_sinks(func: ast.AST, relative: str, params: set[str]) -> list[Atom]:
     """Where a function's own input sets the work or the memory: a loop over it, or a decode, split or decompress of it.
     joserfc's two advisories are of this kind (a JWE recipients list processed in full; compact segments split and
-    decoded before the size check), and the first sinks (eval, pickle, a multiplication) gave the hunts nothing there."""
+    decoded before the size check), and the first sinks (eval, pickle, a multiplication) gave the hunts nothing there.
 
-    params = {arg.arg for arg in func.args.args + func.args.kwonlyargs} - {"self", "cls"}
+    The walk goes into nested functions, which see the outer parameters (a closure over `data` loops over the caller's
+    `data`). The id names the line, not the function, so a loop found from both an outer and an inner function is one
+    atom."""
+
     if not params:
         return []
     out: list[Atom] = []
@@ -125,7 +165,7 @@ def _input_sinks(func: ast.AST, relative: str) -> list[Atom]:
         for it in iters:
             if _rooted_in(it, params):
                 expr = ast.unparse(it)[:60]
-                out.append(Atom(kind="sink", id=f"sink-{relative}-{func.name}-loop-{getattr(it, 'lineno', 0)}",
+                out.append(Atom(kind="sink", id=f"sink-{relative}-loop-{getattr(it, 'lineno', 0)}",
                                 text=f"loop over caller-supplied {expr} in {func.name}", file=relative, function=func.name,
                                 line=getattr(it, "lineno", None)))
         if isinstance(node, ast.Call):
@@ -138,7 +178,7 @@ def _input_sinks(func: ast.AST, relative: str) -> list[Atom]:
                 arg = node.args[0] if node.args else None
             if label and arg is not None and _rooted_in(arg, params):
                 expr = ast.unparse(arg)[:60]
-                out.append(Atom(kind="sink", id=f"sink-{relative}-{func.name}-{label}-{getattr(node, 'lineno', 0)}",
+                out.append(Atom(kind="sink", id=f"sink-{relative}-{label}-{getattr(node, 'lineno', 0)}",
                                 text=f"{label} of caller-supplied {expr} in {func.name}", file=relative, function=func.name,
                                 line=getattr(node, "lineno", None)))
     return out
@@ -246,19 +286,20 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
             continue
         spans[:] = _function_spans(tree)
         owners = _owners(tree)
+        methods = _methods(tree)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                for atom in _input_sinks(node, relative):
+                ordinary, keyword = _parameters(node, method=id(node) in methods)
+                scope = _scope_at(spans, node.lineno) or node.name       # ids by the dotted name: A.f and B.f both stay
+                for atom in _input_sinks(node, relative, {*ordinary, *keyword}):
                     add(sinks, atom)
-                for arg in node.args.args:
-                    if arg.arg in {"self", "cls"}:
-                        continue
+                for name in ordinary:
                     add(
                         sources,
                         Atom(
                             kind="source",
-                            id=f"src-{relative}-{node.name}-{arg.arg}",
-                            text=f"caller argument {arg.arg} of {node.name}",
+                            id=f"src-{relative}-{scope}-{name}",
+                            text=f"caller argument {name} of {node.name}",
                             file=relative,
                             function=node.name,
                             line=node.lineno,
@@ -273,7 +314,7 @@ def extract_atoms(root: Path) -> tuple[list[Atom], list[Atom], list[Atom], list[
                             invariants,
                             Atom(
                                 kind="invariant",
-                                id=f"inv-{relative}-{node.name}-{index}",
+                                id=f"inv-{relative}-{scope}-{index}",
                                 text=sentence,
                                 file=relative,
                                 function=node.name,

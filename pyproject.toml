@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alien-hunt"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Sample defect combinations a plain review does not already produce, then confirm them."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,6 +36,9 @@ alien-hunt = "alien_hunt.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "alien_hunt.__version__" }
 
 [tool.setuptools.package-data]
 alien_hunt = ["data/*.json", "data/semgrep/*"]

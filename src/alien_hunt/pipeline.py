@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from alien_hunt import __version__
 from alien_hunt.agent import PaidModel, read_file, resolve_inside
 from alien_hunt.arms import ARMS_FILE, arm_summary, hunt_order, render_table, select_arms, write_label_sheet
 from alien_hunt.atoms import extract_atoms, filter_invariants
@@ -33,6 +34,7 @@ from alien_hunt.types import Atom, Candidate, Claim, Confirmation, KnownAdvisory
 
 log = logging.getLogger("alien_hunt")
 
+RUN_FILE = "run.json"                 # what a run ran on: version, target, full commit, image (read back by `replay`)
 _PLAIN_SYSTEM_NOTE = "STAGE: invariants"
 _PLAIN_PASSES = 3
 _MAX_CONSECUTIVE_FAILURES = 3
@@ -444,6 +446,20 @@ def execute(
     out_dir.mkdir(parents=True, exist_ok=True)
     local = out_dir / "local"
     local.mkdir(exist_ok=True)
+    dump_json(                                  # first, so a run killed outright still says what it ran on
+        out_dir / RUN_FILE,
+        {
+            "alien_hunt": __version__,
+            "run_id": run_id,
+            "target": target,
+            "commit": commit,
+            "confirm_mode": confirm_mode,
+            "container_image": container_image,
+            "seed": seed,
+            "sample_limit": sample_limit,
+            "arms": arms,
+        },
+    )
     paid = PaidModel(model, budget, prices)
     state = RunState()
     when = commit_time or datetime.now(timezone.utc)
@@ -510,14 +526,31 @@ def _confirm(
     image: str,
     commit_time: datetime,
 ) -> None:
-    if not state.claims:
+    for pair in iter_confirmations(state.claims, checkout, out_dir / "work", mode=mode, image=image,
+                                   commit_time=commit_time):
+        state.confirmations.append(pair)              # one at a time: an interrupt keeps what was confirmed so far
+
+
+def iter_confirmations(
+    claims: list[Claim],
+    checkout: Path,
+    work: Path,
+    *,
+    mode: str,
+    image: str,
+    commit_time: datetime,
+):
+    """Confirm each claim against one checkout and yield (claim, confirmation) as each finishes. With Podman the
+    wheels are prepared once, for the commit's date; a failed install runs the reproducers without them. An error on
+    one claim is that claim's refusal. `mode="local"` runs on the host and is for fixtures only."""
+
+    if not claims:
         return
-    work = out_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
     deps = DepsStatus(True, "not requested")
     if mode == "podman":
         try:                                               # no install, or a broken one, must not void every claim
-            imports = reproducer_imports([claim.reproducer for claim in state.claims], set(package_names(checkout)))
+            imports = reproducer_imports([claim.reproducer for claim in claims], set(package_names(checkout)))
             deps = prepare_wheels(checkout, commit_time, work, imports=imports, python_tag=python_tag_for(image))
             log.info("dependencies: %s", deps.why)
             if deps.ok and deps.target is not None:
@@ -528,7 +561,7 @@ def _confirm(
             deps = DepsStatus(False, f"could not prepare dependencies: {exc}")
         if not deps.ok:
             log.warning("running the reproducers without dependencies: %s", deps.why)
-    for index, claim in enumerate(state.claims):
+    for index, claim in enumerate(claims):
         slot = work / f"claim-{index}"
         try:
             if mode == "local":
@@ -537,7 +570,7 @@ def _confirm(
                 confirmation = confirm_podman(claim, checkout, slot, image=image, deps=deps)
         except Exception as exc:
             confirmation = Confirmation(False, f"confirmation error: {exc}")
-        state.confirmations.append((claim, confirmation))
+        yield claim, confirmation
 
 
 def _persist(

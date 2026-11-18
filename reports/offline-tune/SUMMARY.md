@@ -90,7 +90,7 @@ Variants the agents tried and dropped, all on the tuning split (baseline 24.7%, 
 
 - **Draw.** The pool holds about 141 functions with atoms per case and 20 pairs touch at most 40 of them. A perfect draw of 40 distinct functions would reach about 32% on tuning before retention; the draw lever is close to spent.
 - **Retention.** Removing the caps entirely gives atom_hit of 92.8% (tuning) and 95.7% (held-out). The kept retention reaches 65.2% and 57.6%. Raising the caps raised atom_hit and lowered drawn_hit, so the keep rule refuses it.
-- **Extraction.** Half of the cases still missing have no atom in the fixed function: zero-parameter or keyword-only functions, module-level code, config readers. `extract_atoms` reads only `args.args`, so keyword-only parameters produce no source. That is an extraction change and was left alone. It is the next thing to look at.
+- **Extraction.** Half of the cases still missing have no atom in the fixed function: zero-parameter or keyword-only functions, module-level code, config readers. `extract_atoms` reads only `args.args`, so keyword-only parameters produce no source. That is an extraction change and was left alone. It is the next thing to look at. (Tried for 0.2.0: under the fixed caps, sources from those parameters pushed lighter functions out and did not raise the share of draws that reach the fix; see CHANGELOG.md.)
 
 ### Caveats
 

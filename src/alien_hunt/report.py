@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from alien_hunt import __version__
 from alien_hunt.budget import Budget
 from alien_hunt.redact import matching_advisory, redact
 from alien_hunt.score import coherence_miss_rate
@@ -146,6 +147,7 @@ def render_report(
     body = f"""# Alien-hunt report
 
 - Run: {run_id}
+- alien-hunt: {__version__}
 - Target: {target}
 - Commit: {commit or "local"}
 - Stopped early: {"yes" if stopped else "no"}
