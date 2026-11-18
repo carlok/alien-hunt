@@ -35,7 +35,7 @@ The trace, which runs in the container, counts a function as entered by file and
 
 This shows that the script tested something the repository did, and that the test came out; it is no proof of a defect. What the check does not stop, found by reading it from outside (`reports/offline-tune/SUMMARY.md` has the scripts):
 
-- **A test that comes out true for correct behaviour.** An inverted comparison (`len(got) == 3` printed when the call is right), `is not None`, `type(got) is list`, `isinstance`. Telling these from a real defect takes a differential run: the same script must stay silent against a fixed version.
+- **A test that comes out true for correct behaviour.** An inverted comparison (`len(got) == 3` printed when the call is right), `is not None`, `type(got) is list`, `isinstance`. Telling these from a real defect takes a differential run: the same script must stay silent against a fixed version. Where a fix exists, `alien-hunt replay --against` is that run (see [Replay](#replay)).
 - **A correct rejection reported as a defect.** `try: f(None)` with `except TypeError: print(...)`, a broad `except Exception`, and a print after a call that did not raise have the same shape as the claims worth making: that the call should have raised, or crashed on valid input.
 - **Arguments that test nothing.** A default or stub argument whose output is then compared with a literal.
 - **A claim that names several functions counts when any one ran,** and an inherited method is matched by its bare name, so a base-class constructor run by another class counts.
@@ -96,6 +96,25 @@ Nine runs on 2026-10-30, all with Claude Sonnet 5.5 for chat and `text-embedding
   - Neither advisory was found. The sinks and mechanisms for that kind of defect were added afterwards. In the last run they reached the candidate pool, but the sampler drew no candidate in the advisories' functions.
 - Other confirmed claims were minor and aren't listed.
 - **joserfc, 1 more run on 2026-11-02, with the current check (1.98 USD).** 9 candidates were hunted, against 1 in the run before it. The plain reviews found the `validate_exp` bug again, and the first version of the current check refused it because its marker sat in a `try` body, which is why that form now counts. Replayed in Podman with no model calls, all 6 of the run's claims confirm. The 2 from hunts, read by hand, aren't worth reporting: a marker in the right place does not make a claim a defect. Neither advisory was hunted.
+
+## Replay
+
+A run saves every claim it makes, reproducer included, in `out/<run>/local/claims.jsonl`, and what it ran on in `out/<run>/run.json`. `replay` confirms those claims again with the current check. It makes no model call and needs no API key.
+
+```bash
+alien-hunt replay out/<run>                                  # the same commit, with today's check
+alien-hunt replay out/<run> --against <fix-sha>              # and the confirmed ones on a second commit
+alien-hunt replay out/<old-run> https://github.com/owner/repo --commit <sha>   # a run from before run.json
+```
+
+With `--against` (or `--against-local PATH`) each claim confirmed on the run's commit is confirmed again on the second tree, typically the commit that fixed an advisory:
+
+- **fixed there**: it confirms on the vulnerable commit and is refused on the fix. Read the refusal: a fix that removed or renamed the function also refuses.
+- **fires there too**: it still prints the marker on the fixed code. Either the defect is still there, or the test comes out true for correct behaviour, the case the check alone cannot tell apart.
+
+The table shows claim ids (the ones `arms` uses), sides, classes, verdicts and reasons, never claim text or reproducers. The details go to `out/<run>/local/replay-<time>.json`. Reproducers run in Podman, as in a run, with the run's container image unless `--image` says otherwise.
+
+The runs under [Results so far](#results-so-far) used the older check. Their folders are not in this repository; `replay` is how to re-check them.
 
 ## Does the score choose anything?
 
