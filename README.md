@@ -70,6 +70,15 @@ alien-hunt run https://github.com/authlib/joserfc \
   --known cases/joserfc.toml
 ```
 
+To see what a run would work with before paying for it, `pool` prints the atoms it keeps and the pairs it would draw, with no model, no API key and no cost (`--json` for the raw list):
+
+```bash
+alien-hunt pool https://github.com/mbr/asciitree --commit fcde62d5c0f1e5c36dc0100265b3c735ca9673a2
+alien-hunt pool --local path/to/checkout --seed 1
+```
+
+Its invariants are not filtered by the model, so a run's pool is the same or smaller.
+
 The first commit is PyJWT 2.3.0, before the public fix for GHSA-ffqj-6fqr-9h24. The allowlist lets the report cite that advisory when a confirmed claim has class `key confusion` and touches the listed symbols. The second target is [asciitree](https://github.com/mbr/asciitree) at `fcde62d5c0f1e5c36dc0100265b3c735ca9673a2`: pure Python, tests in tree, 91 GitHub stars, and no OSV advisory at the time it was pinned. Its report uses aliases only.
 
 joserfc needs Python 3.11 or later, so its run needs `container_image = "docker.io/library/python:3.12-slim"`. Its commit is the parent of the first fix for its two denial-of-service advisories (GHSA-jpxq-7h8p-2q76 and GHSA-9pg5-8c7x-5hfx).

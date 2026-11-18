@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import tomllib
@@ -83,6 +84,15 @@ def build_parser() -> argparse.ArgumentParser:
     again.add_argument("--image", help="container image (default: the run's, then the config's)")
     again.add_argument("--config", type=Path, default=Path("alien-hunt.toml"))
     again.add_argument("--out", type=Path, default=Path("out"), help="where fetched checkouts go")
+    pool = sub.add_parser("pool", help="show the atoms and pairs a run would draw (no model, no key, no cost)")
+    pool.add_argument("url", nargs="?", help="https://github.com/owner/repo")
+    pool.add_argument("--local", type=Path, help="look at an existing checkout instead of cloning")
+    pool.add_argument("--commit", help="commit sha to fetch")
+    pool.add_argument("--seed", type=int, default=0)
+    pool.add_argument("--sample-limit", type=int, help="default: the config's, else 80")
+    pool.add_argument("--config", type=Path, default=Path("alien-hunt.toml"))
+    pool.add_argument("--out", type=Path, default=Path("out"), help="where a fetched checkout goes")
+    pool.add_argument("--json", action="store_true", help="print the raw result as JSON")
     return parser
 
 
@@ -91,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    commands = {"run": _run, "arms": _arms, "replay": _replay}
+    commands = {"run": _run, "arms": _arms, "replay": _replay, "pool": _pool}
     try:
         return commands[args.command](args)
     except (ConfigError, CheckoutError) as exc:
@@ -164,6 +174,34 @@ def _replay(args: argparse.Namespace) -> int:
     verdicts = replay(claims, here, local / f"replay-{stamp}", there=there, image=str(image))
     dump(verdicts, local / f"replay-{stamp}.json", here, there)
     print(render(verdicts, here, there))
+    return 0
+
+
+def _pool(args: argparse.Namespace) -> int:
+    from alien_hunt.preview import preview, render
+
+    if args.url and args.local:
+        raise CheckoutError("pass either a GitHub URL or --local")
+    if args.local:
+        checkout = prepare_local(args.local)
+        label = str(checkout)
+    elif args.url:
+        parse_github_url(args.url)
+        if not args.commit:
+            raise CheckoutError("a --commit sha is required for a GitHub URL")
+        commit = validate_sha(args.commit)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        checkout = fetch_github(args.url, commit, args.out / f"src-{stamp}")
+        label = f"{args.url} at {commit[:12]}"
+    else:
+        raise CheckoutError("pass a GitHub URL or --local")
+    limit = args.sample_limit
+    if limit is None and args.config.is_file():
+        limit = load_config(args.config).sample_limit
+    if limit is not None and limit < 1:
+        raise ConfigError("--sample-limit must be >= 1")
+    result = preview(checkout, sample_limit=limit or 80, seed=args.seed)
+    print(json.dumps(result, indent=2, sort_keys=True) if args.json else render(result, label))
     return 0
 
 
