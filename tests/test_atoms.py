@@ -116,3 +116,80 @@ def test_atoms_record_the_function_they_sit_in(tmp_path: Path):
     assert sink_scope["pickle.loads"] == "fn_one.fn_two"                               # the callee is named, the scope is its caller
     assert sink_scope["multiplication"] == "Klass.method_a"
     assert [atom.scope for atom in invariants] == ["Klass.method_a"]
+
+
+_KINDS = (
+    "def pos_zq(first, /):\n    return first\n\n"
+    "def kw_zq(*, key):\n    return key\n\n"
+    "def var_zq(*parts):\n    return parts\n\n"
+    "def kws_zq(**options):\n    return options\n\n"
+    "def none_zq():\n    return 1\n"
+)
+
+
+def test_every_kind_of_parameter_is_a_source(tmp_path: Path):
+    sources, _, _, _ = extract_atoms(_library(tmp_path, {"pkg/kinds_zq.py": _KINDS}))
+    assert sorted(atom.text for atom in sources) == [
+        "caller argument **options of kws_zq",
+        "caller argument *parts of var_zq",
+        "caller argument first of pos_zq",
+        "caller argument key of kw_zq",
+    ]
+
+
+_RECEIVERS = (
+    "class Klass:\n"
+    "    def method_zq(this, value):\n        return value\n\n"
+    "    @staticmethod\n"
+    "    def static_zq(first):\n        return first\n\n"
+    "    @classmethod\n"
+    "    def build_zq(klass, raw):\n        return raw\n\n"
+    "def loose_zq(self, data):\n    return data\n\n"
+    "def plain_zq(this, data):\n    return data\n"
+)
+
+
+def test_the_receiver_is_dropped_by_position_not_by_name(tmp_path: Path):
+    sources, _, _, _ = extract_atoms(_library(tmp_path, {"pkg/recv_zq.py": _RECEIVERS}))
+    assert sorted(atom.text for atom in sources) == [
+        "caller argument data of loose_zq",
+        "caller argument first of static_zq",
+        "caller argument raw of build_zq",
+        "caller argument this of plain_zq",
+        "caller argument value of method_zq",
+    ]
+
+
+_TWINS = (
+    "class One:\n"
+    "    def setup_zq(self, key):\n        \"\"\"The key must not be empty.\"\"\"\n        return key\n\n"
+    "class Two:\n"
+    "    def setup_zq(self, key):\n        \"\"\"The key must not be empty.\"\"\"\n        return key\n"
+)
+
+
+def test_same_named_methods_in_two_classes_keep_their_own_atoms(tmp_path: Path):
+    sources, _, invariants, _ = extract_atoms(_library(tmp_path, {"pkg/twins_zq.py": _TWINS}))
+    assert sorted(atom.scope for atom in sources) == ["One.setup_zq", "Two.setup_zq"]
+    assert sorted(atom.scope for atom in invariants) == ["One.setup_zq", "Two.setup_zq"]
+    assert len({atom.id for atom in sources + invariants}) == 4
+
+
+_LOOPS = (
+    "def walk_zq(*, items):\n    for item in items:\n        print(item)\n\n"
+    "def join_zq(*parts):\n    return [part for part in parts]\n\n"
+    "def outer_zq(data):\n"
+    "    def inner_zq(data):\n"
+    "        for item in data:\n"
+    "            print(item)\n"
+    "    return inner_zq\n"
+)
+
+
+def test_loops_over_keyword_only_and_star_parameters_are_sinks_and_a_shared_loop_is_one(tmp_path: Path):
+    _, sinks, _, _ = extract_atoms(_library(tmp_path, {"pkg/loops_zq.py": _LOOPS}))
+    loops = sorted(atom.text for atom in sinks if atom.text.startswith("loop over"))
+    assert "loop over caller-supplied items in walk_zq" in loops
+    assert "loop over caller-supplied parts in join_zq" in loops
+    shared = [atom for atom in sinks if atom.line == 10]
+    assert len(shared) == 1 and shared[0].scope == "outer_zq.inner_zq"
