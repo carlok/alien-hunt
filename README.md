@@ -105,6 +105,7 @@ Nine runs on 2026-10-30, all with Claude Sonnet 5.5 for chat and `text-embedding
   - Neither advisory was found. The sinks and mechanisms for that kind of defect were added afterwards. In the last run they reached the candidate pool, but the sampler drew no candidate in the advisories' functions.
 - Other confirmed claims were minor and aren't listed.
 - **joserfc, 1 more run on 2026-11-02, with the current check (1.98 USD).** 9 candidates were hunted, against 1 in the run before it. The plain reviews found the `validate_exp` bug again, and the first version of the current check refused it because its marker sat in a `try` body, which is why that form now counts. Replayed in Podman with no model calls, all 6 of the run's claims confirm. The 2 from hunts, read by hand, aren't worth reporting: a marker in the right place does not make a claim a defect. Neither advisory was hunted.
+- **joserfc, 1 run on 2026-11-22 with `--arms 10` (alien-hunt 0.2.0, Claude Sonnet 5.5, 1.43 USD).** For the first time a directed hunt confirmed one of the two advisories, GHSA-jpxq-7h8p-2q76: its reproducer passes 200,000 recipients to `extract_general_json`, which processes all of them. `replay --against` the advisory's fix (`d6dc8df`) refuses that claim, so it is specific to the defect the fix removed. The advisory was public before the run, so the model may have known of it. The other advisory (GHSA-9pg5-8c7x-5hfx) was claimed and not confirmed. Of the other confirmed claims, AH-1 (state-mutation, plain) and AH-4 (unbounded-allocation-before-size-check, directed) still print the marker on upstream joserfc at `e65b379`; whether either is a defect has not been decided. The selection comparison is under [Does the score choose anything?](#does-the-score-choose-anything)
 
 ## Replay
 
@@ -129,7 +130,15 @@ The runs under [Results so far](#results-so-far) used the older check. Their fol
 
 Not so far. In the five runs whose records show what was hunted (the fourth on PyJWT and four on joserfc), the hunted set is exactly the candidates at or above the floor, and the limit of 20 never cut any. So the floor chose, and the unavailability term only set the order. The results above came through the floor. The paper's author [suggested the test](https://github.com/alejandrohdez00/alien-space-of-science/issues/2): the combined score against coherence alone and a random draw, under the same investigation budget.
 
-`--arms N` runs it. It has not been run yet.
+`--arms N` runs it. It has been run once, on joserfc on 2026-11-22, with 10 hunts per rule; nothing was cut short, and the whole run cost 1.43 USD:
+
+| Rule | Hunts | USD | Above the floor | On an advisory | Claims | Confirmed issues | Advisory confirmed | Real |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| combined | 10 | 0.28 | 6 | 6 | 4 | 2 | GHSA-jpxq-7h8p-2q76 | 1 |
+| coherence | 10 | 0.29 | 9 | 4 | 6 | 3 | GHSA-jpxq-7h8p-2q76 | 3 |
+| random | 10 | 0.26 | 3 | 4 | 3 | 3 | GHSA-jpxq-7h8p-2q76 | 2 |
+
+The 30 picks were 20 distinct candidates, and 3 were picked by all three rules. The advisory claim came from one of those 3, so it counts for every rule. The six hunt claims were labeled blind by a separate model reviewer, not a person: it saw only the shuffled label sheet and the library's source at the commit, and marked three real (the advisory, a NaN `exp` that never expires, and a token accepted when `exp` equals now) and three not. The last real one is a claim the check refused, which is why refused claims are labeled too. On this run coherence alone found all three real issues, a random draw two, and the combined score only the shared advisory pick. With 10 hunts per rule on one library that says little either way. The command:
 
 ```bash
 alien-hunt run https://github.com/authlib/joserfc \
@@ -142,7 +151,7 @@ alien-hunt run https://github.com/authlib/joserfc \
 - The floor is off, and each rule picks N from the same pool: `combined` by the score at β = 0.7, `coherence` by the rating with ties broken at random, `random` a draw. The reviews and the pool are paid once.
 - What the rules share is a number of hunts, not USD. The table shows what each one cost.
 - A pick two rules share is hunted once and counts for both, with its full cost. The rules take turns, but a run cut short by the budget or an error is not a fair comparison, and `alien-hunt arms` says how many were.
-- On the last joserfc run the reviews and the pool cost 1.50 USD and a hunt about 0.05 USD, so `--arms 10` should cost at most about 3 USD, if low-rated candidates cost the same to hunt.
+- On the last joserfc run the reviews and the pool cost 1.50 USD and a hunt about 0.05 USD, so `--arms 10` should cost at most about 3 USD, if low-rated candidates cost the same to hunt. The first one cost 1.43 USD in all.
 
 `REPORT.md` gets a table of counts, and `06-arms.json` holds which rule picked what. "Confirmed" alone is a weak outcome, as the run above shows, so `local/arms-to-label.jsonl` lists every hunt's claim, refused ones too, shuffled and without its rule. Label them from that file alone, before reading the report or anything else in the run's folder, which can tell a claim's rule. The labels are a JSON file from claim id to `"real"` or `"not"`. Then add up the runs:
 
