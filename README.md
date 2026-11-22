@@ -132,13 +132,13 @@ Not so far. In the five runs whose records show what was hunted (the fourth on P
 
 `--arms N` runs it. It has been run once, on joserfc on 2026-11-22, with 10 hunts per rule; nothing was cut short, and the whole run cost 1.43 USD:
 
-| Rule | Hunts | USD | Above the floor | On an advisory | Claims | Confirmed issues | Advisory confirmed |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| combined | 10 | 0.28 | 6 | 6 | 4 | 2 | GHSA-jpxq-7h8p-2q76 |
-| coherence | 10 | 0.29 | 9 | 4 | 6 | 3 | GHSA-jpxq-7h8p-2q76 |
-| random | 10 | 0.26 | 3 | 4 | 3 | 3 | GHSA-jpxq-7h8p-2q76 |
+| Rule | Hunts | USD | Above the floor | On an advisory | Claims | Confirmed issues | Advisory confirmed | Real |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| combined | 10 | 0.28 | 6 | 6 | 4 | 2 | GHSA-jpxq-7h8p-2q76 | 1 |
+| coherence | 10 | 0.29 | 9 | 4 | 6 | 3 | GHSA-jpxq-7h8p-2q76 | 3 |
+| random | 10 | 0.26 | 3 | 4 | 3 | 3 | GHSA-jpxq-7h8p-2q76 | 2 |
 
-The 30 picks were 20 distinct candidates, and 3 were picked by all three rules. The advisory claim came from one of those 3, so it counts for every rule. On this run the combined score did no better than coherence alone or a random draw. The hunt claims have not been labeled yet, so there is no count of real issues, and one run on one library says little either way. The command:
+The 30 picks were 20 distinct candidates, and 3 were picked by all three rules. The advisory claim came from one of those 3, so it counts for every rule. The six hunt claims were labeled blind by a separate model reviewer, not a person: it saw only the shuffled label sheet and the library's source at the commit, and marked three real (the advisory, a NaN `exp` that never expires, and a token accepted when `exp` equals now) and three not. The last real one is a claim the check refused, which is why refused claims are labeled too. On this run coherence alone found all three real issues and the combined score only the shared advisory pick, so the score did no better than its parts. With 10 hunts per rule on one library that says little either way. The command:
 
 ```bash
 alien-hunt run https://github.com/authlib/joserfc \
